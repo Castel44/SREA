@@ -12,13 +12,11 @@ Coming soon...
 ## Citing SREA
 If this code has been useful, use this:
 ```BibTex
-@misc{castellani2021estimating,
+@inproceedings{castellani2021estimating,
       title={Estimating the electrical power output of industrial devices with end-to-end time-series classification in the presence of label noise}, 
       author={Andrea Castellani and Sebastian Schmitt and Barbara Hammer},
       year={2021},
-      eprint={2105.00349},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
+      booktitle={ECML/PKDD}
 }
 ```
 
