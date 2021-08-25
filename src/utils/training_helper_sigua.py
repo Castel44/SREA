@@ -1,126 +1,30 @@
 import collections
 import os
 import shutil
-from itertools import chain
-
 import matplotlib as mpl
+
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from matplotlib import cm
-from matplotlib import pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from src.models.model import MLPAE, TCNAE, LSTMAE, CNNAE
+
+from src.models.model import CNNAE
 from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
 from src.utils.saver import Saver
-from src.utils.training_helper_utils import reset_seed_, evaluate_class_recons, plot_embedding, plot_results, columns, \
-    mapper, remove_empty_dirs
-from src.utils.utils import readable
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+from src.utils.utils import readable, reset_seed_, reset_model, flip_label, map_abg, remove_empty_dirs, \
+    evaluate_class
+from src.utils.plotting_utils import plot_results, plot_embedding
 
 ######################################################################################################
-class MplColorHelper:
-    def __init__(self, cmap_name, start_val, stop_val):
-        self.cmap_name = cmap_name
-        self.cmap = plt.get_cmap(cmap_name)
-        self.norm = mpl.colors.Normalize(vmin=start_val, vmax=stop_val)
-        self.scalarMap = cm.ScalarMappable(norm=self.norm, cmap=self.cmap)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+columns = shutil.get_terminal_size().columns
 
-    def get_rgb(self, val):
-        return self.scalarMap.to_rgba(val)
-
-
-def reset_seed_(seed):
-    # Resetting SEED to fair comparison of results
-    print('Settint seed: {}'.format(seed))
-    torch.manual_seed(seed)
-    if device == 'cuda':
-        torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-
-
-def reset_model(model):
-    print('Resetting model parameters...')
-    for layer in model.modules():
-        if hasattr(layer, 'reset_parameters'):
-            layer.reset_parameters()
-    return model
-
-
-# Unique labels
-def categorizer(y_cont, y_discrete):
-    Yd = np.diff(y_cont, axis=0)
-    Yd = (Yd > 0).astype(int).squeeze()
-    C = pd.Series([x + y for x, y in
-                   zip(list(y_discrete[1:].astype(int).astype(str)), list((Yd).astype(str)))]).astype(
-        'category')
-    return C.cat.codes
-
-
-def RF_check(kernel_size, blocks, history):
-    RF = (kernel_size - 1) * blocks * 2 ** (blocks - 1)
-    print('Receptive field: {}, History window: {}'.format(RF, history))
-    if RF > history:
-        print('OK')
-    else:
-        while RF <= history:
-            blocks += 1
-            RF = (kernel_size - 1) * blocks * 2 ** (blocks - 1)
-            print('Adding layers.. L: {}, RF:{}'.format(blocks, RF))
-
-    print('Receptive field: {}, History window: {}, LAYERS:{}'.format(RF, history, blocks))
-    return blocks
-
-
-def append_results_dict(main, sub):
-    for k, v in zip(sub.keys(), sub.values()):
-        main[k].append(v)
-    return main
-
-
-def flip_label(target, ratio, pattern=0):
-    target = np.array(target).astype(int)
-    label = target.copy()
-    n_class = len(np.unique(label))
-
-    if type(pattern) is int:
-        for i in range(label.shape[0]):
-            if (pattern % n_class) == 0:
-                p1 = ratio / (n_class - 1) * np.ones(n_class)
-                p1[label[i]] = 1 - ratio
-                label[i] = np.random.choice(n_class, p=p1)
-            elif pattern > 0:
-                # Asymm
-                label[i] = np.random.choice([label[i], (target[i] + pattern) % n_class], p=[1 - ratio, ratio])
-            else:
-                label[i] = np.random.choice([label[i], 0], p=[1 - ratio, ratio])
-
-    elif type(pattern) is str:
-        raise ValueError
-
-    mask = np.array([int(x != y) for (x, y) in zip(target, label)])
-
-    return label, mask
-
-def temperature(x, th_low, th_high, low_val, high_val):
-    if x <= th_low:
-        return low_val
-    elif th_low < x < th_high:
-        return (x - th_low) / (th_high - th_low) * (high_val - low_val) + low_val
-    else:  # x == th_high
-        return high_val
-
-
-def linear_comb(w, x1, x2):
-    return (1 - w) * x1 + w * x2
-
-
+######################################################################################################
 def sigua_loss(model_loss, rt, bad_weight):
     num_total_data = int(model_loss.size(0))
     num_good_data = int(num_total_data * rt)
@@ -257,19 +161,6 @@ def train_model(model, train_loader, valid_loader, test_loader, args, tau):
     return model
 
 
-def boxplot_results(data, keys, classes, network, saver):
-    n = len(keys)
-    x = 'noise'
-    hue = 'correct'
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8, 7 + (n * 0.1)), sharex='all')
-    for ax, k in zip(axes, keys):
-        sns.boxplot(x=x, y=k, hue=hue, data=data, ax=ax)
-        ax.grid(True, alpha=0.2)
-    axes[0].set_title('Model:{} classes:{} - Co-Teaching'.format(network, classes))
-    fig.tight_layout()
-    saver.save_fig(fig, 'boxplot')
-
-
 def train_eval_model(models, x_train, x_valid, x_test, Y_train, Y_valid, Y_test, Y_train_clean, Y_valid_clean,
                      ni, args, saver, plt_embedding=True, plt_cm=True):
     train_dataset = TensorDataset(torch.from_numpy(x_train).float(), torch.from_numpy(Y_train).long())
@@ -291,16 +182,16 @@ def train_eval_model(models, x_train, x_valid, x_test, Y_train, Y_valid, Y_test,
     print('Train ended')
 
     ######################################################################################################
-    train_results = evaluate_class_recons(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
-                                          args.network, 'Train', True, plt_cm=plt_cm, plt_lables=False)
-    valid_results = evaluate_class_recons(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
-                                          args.network, 'Valid', True, plt_cm=plt_cm, plt_lables=False)
-    test_results = evaluate_class_recons(model, x_test, Y_test, None, test_loader, ni, saver, args.network,
+    train_results = evaluate_class(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
+                                          'CNN', 'Train', True, plt_cm=plt_cm, plt_lables=False)
+    valid_results = evaluate_class(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
+                                          'CNN', 'Valid', True, plt_cm=plt_cm, plt_lables=False)
+    test_results = evaluate_class(model, x_test, Y_test, None, test_loader, ni, saver, 'CNN',
                                          'Test', True, plt_cm=plt_cm, plt_lables=False)
 
     if plt_embedding and args.embedding_size <= 3:
         plot_embedding(model.encoder, train_eval_loader, valid_loader, Y_train_clean, Y_valid_clean,
-                       Y_train, Y_valid, network=args.network, saver=saver, correct=True)
+                       Y_train, Y_valid, network='CNN', saver=saver, correct=True)
 
     plt.close('all')
     torch.cuda.empty_cache()
@@ -321,46 +212,19 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
     history = x_train.shape[1]
 
     # Network definition
-    if args.nonlin_classifier:
-        classifier = NonLinClassifier(args.embedding_size, classes, d_hidd=args.classifier_dim, dropout=args.dropout,
+    classifier = NonLinClassifier(args.embedding_size, classes, d_hidd=args.classifier_dim, dropout=args.dropout,
                                       norm=args.normalization)
-    else:
-        classifier = LinClassifier(args.embedding_size, classes)
 
-    if args.network == 'MLP':
-        # Reshape data for MLP
-        x_train = np.hstack([(x_train[:, :, i]) for i in range(x_train.shape[2])])
-        x_valid = np.hstack([(x_valid[:, :, i]) for i in range(x_valid.shape[2])])
-        x_test = np.hstack([(x_test[:, :, i]) for i in range(x_test.shape[2])])
-
-        model = MLPAE(input_shape=x_train.shape[1], embedding_dim=args.embedding_size, hidden_neurons=args.neurons,
-                      hidd_act=eval(args.hidden_activation), dropout=args.dropout,
-                      normalization=args.normalization).to(device)
-
-    elif args.network == 'TCN':
-        stacked_layers = RF_check(args.kernel_size, args.stack, history)
-
-        model = TCNAE(input_size=x_train.shape[2], num_filters=args.filter_number, embedding_dim=args.embedding_size,
-                      seq_len=x_train.shape[1], num_stack=stacked_layers, kernel_size=args.kernel_size,
-                      dropout=args.dropout, normalization=args.normalization).to(device)
-
-    elif args.network == 'CNN':
-        model = CNNAE(input_size=x_train.shape[2], num_filters=args.filters, embedding_dim=args.embedding_size,
+    model = CNNAE(input_size=x_train.shape[2], num_filters=args.filters, embedding_dim=args.embedding_size,
                       seq_len=x_train.shape[1], kernel_size=args.kernel_size, stride=args.stride,
                       padding=args.padding, dropout=args.dropout, normalization=args.normalization).to(device)
 
-    elif args.network == 'LSTM':
-        model = LSTMAE(seq_len_out=x_train.shape[1], n_features=x_train.shape[2],
-                       n_layers=args.rnn_layers, embedding_dim=args.embedding_size).to(device)
-    else:
-        raise NotImplementedError
-
     ######################################################################################################
     # model is multi task - AE Branch and Classification branch
-    model = MetaModel(ae=model, classifier=classifier, n_out=args.n_out, name=args.network).to(device)
+    model = MetaModel(ae=model, classifier=classifier, name='CNN').to(device)
 
     nParams = sum([p.nelement() for p in model.parameters()])
-    s = 'MODEL: %s: Number of parameters: %s' % (args.network, readable(nParams))
+    s = 'MODEL: %s: Number of parameters: %s' % ('CNN', readable(nParams))
     print(s)
     saver.append_str([s])
 
@@ -425,24 +289,24 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
             test_results['noise'] = ni
             test_results['seed'] = seed
             test_results['correct'] = 'SIGUA'
-            test_results['losses'] = mapper(args.abg)
+            test_results['losses'] = map_abg([0, 1, 0])
             # saver_loop.append_str(['Test Results:'])
             # saver_loop.append_dict(test_results)
             df_results = df_results.append(test_results, ignore_index=True)
 
         if args.plt_cm:
-            fig_title = f"SIGUA -- Dataset: {args.dataset} - Model: {args.network} - classes:{classes} - runs:{args.n_runs} "
+            fig_title = f"SIGUA -- Dataset: {args.dataset} - Model: {'CNN'} - classes:{classes} - runs:{args.n_runs} "
             plot_results(df_results.loc[df_results.seed == seed], keys, saver_loop, x='noise', hue='correct',
                          col='losses',
                          kind='bar', style='whitegrid', title=fig_title)
 
     if args.plt_cm:
         # Losses column should  not change here
-        fig_title = f"SIGUA -- Dataset: {args.dataset} - Model: {args.network} - classes:{classes} - runs:{args.n_runs} "
+        fig_title = f"SIGUA -- Dataset: {args.dataset} - Model: {'CNN'} - classes:{classes} - runs:{args.n_runs} "
         plot_results(df_results, keys, saver, x='noise', hue='correct', col='losses', kind='box', style='whitegrid',
                      title=fig_title)
 
-    # boxplot_results(df_results, keys, classes, args.network, saver)
+    # boxplot_results(df_results, keys, classes, 'CNN', saver)
     # results_summary = df_results.groupby(['noise', 'correct'])[keys].describe().T
     # saver.append_str(['Results main summary', results_summary])
 
