@@ -17,7 +17,7 @@ available_datasets=(
 
 
 export PYTHONPATH=$(pwd)
-export CUDA_VISIBLE_DEVICES=$1
+export CUDA_VISIBLE_DEVICES=${1:-0}
 dataset=( "${@:2}" )
 
 len="${#dataset[@]}"

@@ -1,8 +1,8 @@
 #!/bin/bash
-# example ucr_ablaton.sh GPU_NUMBER DATASET
+# usage example: bash ucr_ablaton.sh GPU_NUMBER DATASET
 
-export PYTHONPATH=$PYTHONPATH:$(pwd)
-export CUDA_VISIBLE_DEVICES=$1
+export PYTHONPATH=$(pwd)
+export CUDA_VISIBLE_DEVICES=${1:-0}
 
 datasets=(
   'CBF'

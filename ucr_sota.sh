@@ -5,9 +5,9 @@ export PYTHONPATH=$PYTHONPATH:$(pwd)
 export CUDA_VISIBLE_DEVICES=${1:-0}
 
 all_datasets=(
-  #'CBF'
-  #'Trace'
-  #'Plane'
+  'CBF'
+  'Trace'
+  'Plane'
   'Symbols'
   'OSULeaf'
   'FaceFour'
@@ -15,7 +15,7 @@ all_datasets=(
   'MelbournePedestrian'
   'Epilepsy'
   'NATOPS'
-  #'PenDigits'
+  'PenDigits'
 )
 
 total="${#all_datasets[@]}"
