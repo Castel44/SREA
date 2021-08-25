@@ -239,6 +239,25 @@ def evaluate_model_multi(model, dataloder, y_true, x_true,
     return report, y_hat_proba, y_hat_labels, accuracy, f1_weighted, xhat, residual, results
 
 
+def evaluate_model(model, dataloder, y_true):
+    yhat = predict(model, dataloder)
+
+    # Classification
+    y_hat_proba = softmax(yhat, axis=1)
+    y_hat_labels = np.argmax(y_hat_proba, axis=1)
+
+    accuracy = accuracy_score(y_true, y_hat_labels)
+    f1_weighted = f1_score(y_true, y_hat_labels, average='weighted')
+
+    cm = confusion_matrix(y_true, y_hat_labels)
+    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+    report = classification_report(y_true, y_hat_labels)
+    print(report)
+
+    return report, y_hat_proba, y_hat_labels, accuracy, f1_weighted
+
+
 def evaluate_class_recons(model, x, Y, Y_clean, dataloader, ni, saver, network='Model', datatype='Train', correct=False,
                           plt_cm=True, plt_lables=True, plt_recons=True):
     print(f'{datatype} score')
@@ -268,6 +287,31 @@ def evaluate_class_recons(model, x, Y, Y_clean, dataloader, ni, saver, network='
     # saver.append_str([f'{datatype}Set', 'Classification report:', results])
     # saver.append_str(['AutoEncoder results:'])
     # saver.append_dict(ae_results)
+    return results_dict
+
+
+def evaluate_class(model, x, Y, Y_clean, dataloader, ni, saver, network='Model', datatype='Train', correct=False,
+                          plt_cm=True, plt_lables=True):
+    print(f'{datatype} score')
+    if Y_clean is not None:
+        T = confusion_matrix(Y_clean, Y)
+    else:
+        T = None
+    results_dict = dict()
+
+    title_str = f'{datatype} - ratio:{ni} - correct:{str(correct)}'
+
+    results, yhat_proba, yhat, acc, f1 = evaluate_model(model, dataloader, Y)
+
+    if plt_cm:
+        plt.plot_cm(confusion_matrix(Y, yhat), T, network=network,
+                title_str=title_str, saver=saver)
+    if plt_lables:
+        plt.plot_pred_labels(Y, yhat, acc, residuals=None, dataset=f'{datatype}. noise:{ni}', saver=saver)
+
+    results_dict['acc'] = acc
+    results_dict['f1_weighted'] = f1
+    #saver.append_str([f'{datatype}Set', 'Classification report:', results])
     return results_dict
 
 

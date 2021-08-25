@@ -1,259 +1,735 @@
 import collections
-import itertools
 import os
 import shutil
-from time import time
-import pickle
 
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from matplotlib import cm
 from matplotlib.lines import Line2D
-from scipy.optimize import linear_sum_assignment
 from scipy.special import softmax
-from sklearn import cluster
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, \
     classification_report
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from src.models.model import MLPAE, TCNAE, LSTMAE, CNNAE
+import scipy.stats as stats
+
+from src.models.model import CNNAE
 from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
-from src.utils.metrics import evaluate_multi
-from src.utils.robust_losses import TaylorCrossEntropy, Unhinged, PHuberCrossEntropy, PHuberGeneralizedCrossEntropy, \
-    GeneralizedCrossEntropy
 from src.utils.saver import Saver
-from src.utils.torch_utils import plot_loss
-from src.utils.torch_utils import predict, predict_multi
-from src.utils.utils import readable
-from src.utils.utils_postprocess import plot_prediction
+from src.utils.utils import readable, reset_seed_, reset_model, flip_label, map_abg, remove_empty_dirs, \
+    evaluate_class
+from src.utils.plotting_utils import plot_results, plot_embedding
 
-from src.utils.utils_mixup_BMM import *
-
+######################################################################################################
 columns = shutil.get_terminal_size().columns
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 ######################################################################################################
-class MplColorHelper:
-    def __init__(self, cmap_name, start_val, stop_val):
-        self.cmap_name = cmap_name
-        self.cmap = plt.get_cmap(cmap_name)
-        self.norm = mpl.colors.Normalize(vmin=start_val, vmax=stop_val)
-        self.scalarMap = cm.ScalarMappable(norm=self.norm, cmap=self.cmap)
-
-    def get_rgb(self, val):
-        return self.scalarMap.to_rgba(val)
+##################### Loss tracking and noise modeling #######################
 
 
-def reset_seed_(seed):
-    # Resetting SEED to fair comparison of results
-    print('Settint seed: {}'.format(seed))
-    torch.manual_seed(seed)
+def track_training_loss(args, model, device, train_loader, epoch, bmm_model1, bmm_model_maxLoss1, bmm_model_minLoss1):
+    model.eval()
+
+    all_losses = torch.Tensor()
+    all_predictions = torch.Tensor()
+    all_probs = torch.Tensor()
+    all_argmaxXentropy = torch.Tensor()
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        prediction = model(data)
+
+        prediction = F.log_softmax(prediction, dim=1)
+        idx_loss = F.nll_loss(prediction, target, reduction='none')
+        idx_loss.detach_()
+        all_losses = torch.cat((all_losses, idx_loss.cpu()))
+        probs = prediction.clone()
+        probs.detach_()
+        all_probs = torch.cat((all_probs, probs.cpu()))
+        arg_entr = torch.max(prediction, dim=1)[1]
+        arg_entr = F.nll_loss(prediction.float(), arg_entr.to(device), reduction='none')
+        arg_entr.detach_()
+        all_argmaxXentropy = torch.cat((all_argmaxXentropy, arg_entr.cpu()))
+
+    loss_tr = all_losses.data.numpy()
+
+    # outliers detection
+    max_perc = np.percentile(loss_tr, 95)
+    min_perc = np.percentile(loss_tr, 5)
+    loss_tr = loss_tr[(loss_tr <= max_perc) & (loss_tr >= min_perc)]
+
+    bmm_model_maxLoss = torch.FloatTensor([max_perc]).to(device)
+    bmm_model_minLoss = torch.FloatTensor([min_perc]).to(device) + 10e-6
+
+    loss_tr = (loss_tr - bmm_model_minLoss.data.cpu().numpy()) / (
+                bmm_model_maxLoss.data.cpu().numpy() - bmm_model_minLoss.data.cpu().numpy() + 1e-6)
+
+    loss_tr[loss_tr >= 1] = 1 - 10e-4
+    loss_tr[loss_tr <= 0] = 10e-4
+
+    bmm_model = BetaMixture1D(max_iters=10)
+    bmm_model.fit(loss_tr)
+
+    bmm_model.create_lookup(1)
+
+    return all_losses.data.numpy(), \
+           all_probs.data.numpy(), \
+           all_argmaxXentropy.numpy(), \
+           bmm_model, bmm_model_maxLoss, bmm_model_minLoss
+
+
+##############################################################################
+
+########################### Cross-entropy loss ###############################
+def train_CrossEntropy(args, model, device, train_loader, optimizer, epoch):
+    model.train()
+    loss_per_batch = []
+
+    acc_train_per_batch = []
+    correct = 0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        output = model(data)
+        output = F.log_softmax(output, dim=1)
+
+        loss = F.nll_loss(output, target)
+
+        loss.backward()
+        optimizer.step()
+        loss_per_batch.append(loss.item())
+
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
+
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item(),
+                       100. * correct / ((batch_idx + 1) * args.batch_size),
+                optimizer.param_groups[0]['lr']))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+    return (loss_per_epoch, acc_train_per_epoch)
+
+
+##############################################################################
+
+############################# Mixup original #################################
+def mixup_data(x, y, alpha=1.0, device='cuda'):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
     if device == 'cuda':
-        torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-
-
-def remove_empty_dir(path):
-    try:
-        os.rmdir(path)
-    except OSError:
-        pass
-
-
-def remove_empty_dirs(path):
-    for root, dirnames, filenames in os.walk(path, topdown=False):
-        for dirname in dirnames:
-            remove_empty_dir(os.path.realpath(os.path.join(root, dirname)))
-
-
-def reset_model(model):
-    print('Resetting model parameters...')
-    for layer in model.modules():
-        if hasattr(layer, 'reset_parameters'):
-            layer.reset_parameters()
-    return model
-
-
-# Unique labels
-def categorizer(y_cont, y_discrete):
-    Yd = np.diff(y_cont, axis=0)
-    Yd = (Yd > 0).astype(int).squeeze()
-    C = pd.Series([x + y for x, y in
-                   zip(list(y_discrete[1:].astype(int).astype(str)), list((Yd).astype(str)))]).astype(
-        'category')
-    return C.cat.codes
-
-
-def RF_check(kernel_size, blocks, history):
-    RF = (kernel_size - 1) * blocks * 2 ** (blocks - 1)
-    print('Receptive field: {}, History window: {}'.format(RF, history))
-    if RF > history:
-        print('OK')
+        index = torch.randperm(batch_size).cuda()
     else:
-        while RF <= history:
-            blocks += 1
-            RF = (kernel_size - 1) * blocks * 2 ** (blocks - 1)
-            print('Adding layers.. L: {}, RF:{}'.format(blocks, RF))
+        index = torch.randperm(batch_size)
 
-    print('Receptive field: {}, History window: {}, LAYERS:{}'.format(RF, history, blocks))
-    return blocks
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
 
 
-def append_results_dict(main, sub):
-    for k, v in zip(sub.keys(), sub.values()):
-        main[k].append(v)
-    return main
+def mixup_criterion(pred, y_a, y_b, lam):
+    return lam * F.nll_loss(pred, y_a) + (1 - lam) * F.nll_loss(pred, y_b)
 
 
-def flip_label(target, ratio, pattern=0):
-    target = np.array(target).astype(int)
-    label = target.copy()
-    n_class = len(np.unique(label))
+def train_mixUp(args, model, device, train_loader, optimizer, epoch, alpha):
+    model.train()
+    loss_per_batch = []
 
-    if type(pattern) is int:
-        for i in range(label.shape[0]):
-            if (pattern % n_class) == 0:
-                p1 = ratio / (n_class - 1) * np.ones(n_class)
-                p1[label[i]] = 1 - ratio
-                label[i] = np.random.choice(n_class, p=p1)
-            elif pattern > 0:
-                # Asymm
-                label[i] = np.random.choice([label[i], (target[i] + pattern) % n_class], p=[1 - ratio, ratio])
-            else:
-                label[i] = np.random.choice([label[i], 0], p=[1 - ratio, ratio])
+    acc_train_per_batch = []
+    correct = 0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
 
-    elif type(pattern) is str:
-        raise ValueError
+        inputs, targets_a, targets_b, lam = mixup_data(data, target, alpha, device)
 
-    mask = np.array([int(x != y) for (x, y) in zip(target, label)])
+        output = model(inputs)
+        output = F.log_softmax(output, dim=1)
+        loss = mixup_criterion(output, targets_a, targets_b, lam)
 
-    return label, mask
+        loss.backward()
+        optimizer.step()
 
-def temperature(x, th_low, th_high, low_val, high_val):
-    if x <= th_low:
-        return low_val
-    elif th_low < x < th_high:
-        return (x - th_low) / (th_high - th_low) * (high_val - low_val) + low_val
-    else:  # x == th_high
-        return high_val
+        loss_per_batch.append(loss.item())
 
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
 
-def linear_comb(w, x1, x2):
-    return (1 - w) * x1 + w * x2
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item(),
+                       100. * correct / ((batch_idx + 1) * args.batch_size),
+                optimizer.param_groups[0]['lr']))
 
-
-def reduce_loss(loss, reduction='mean'):
-    return loss.mean() if reduction == 'mean' else loss.sum() if reduction == 'sum' else loss
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+    return (loss_per_epoch, acc_train_per_epoch)
 
 
-class CentroidLoss(nn.Module):
-    def __init__(self, feat_dim, num_classes, reduction='mean'):
-        super(CentroidLoss, self).__init__()
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim), requires_grad=True)
-        self.reduction = reduction
-        self.rho = 1.0
+##############################################################################
 
-    def forward(self, h, y):
-        C = self.centers
-        norm_squared = torch.sum((h.unsqueeze(1) - C) ** 2, 2)
-        # Attractive
-        distance = norm_squared.gather(1, y.unsqueeze(1)).squeeze()
-        # Repulsive
-        logsum = torch.logsumexp(-torch.sqrt(norm_squared), dim=1)
-        loss = reduce_loss(distance + logsum, reduction=self.reduction)
-        # Regularization
-        reg = self.regularization(reduction='sum')
-        return loss + self.rho * reg
-
-    def regularization(self, reduction='sum'):
-        C = self.centers
-        pairwise_dist = torch.cdist(C, C, p=2) ** 2
-        pairwise_dist = pairwise_dist.masked_fill(
-            torch.zeros((C.size(0), C.size(0))).fill_diagonal_(1).bool().to(device), float('inf'))
-        distance_reg = reduce_loss(-(torch.min(torch.log(pairwise_dist), dim=-1)[0]), reduction=reduction)
-        return distance_reg
+########################## Mixup + Dynamic Hard Bootstrapping ##################################
+# Mixup with hard bootstrapping using the beta model
+def reg_loss_class(mean_tab, num_classes=10):
+    loss = 0
+    for items in mean_tab:
+        loss += (1. / num_classes) * torch.log((1. / num_classes) / items)
+    return loss
 
 
-def cluster_accuracy(y_true, y_predicted, cluster_number=None):
-    """
-    Calculate clustering accuracy after using the linear_sum_assignment function in SciPy to
-    determine reassignments.
-
-    :param y_true: list of true cluster numbers, an integer array 0-indexed
-    :param y_predicted: list  of predicted cluster numbers, an integer array 0-indexed
-    :param cluster_number: number of clusters, if None then calculated from input
-    :return: reassignment dictionary, clustering accuracy
-    """
-    if cluster_number is None:
-        cluster_number = (
-                max(y_predicted.max(), y_true.max()) + 1
-        )  # assume labels are 0-indexed
-    count_matrix = np.zeros((cluster_number, cluster_number), dtype=np.int64)
-    for i in range(y_predicted.size):
-        count_matrix[y_predicted[i], y_true[i]] += 1
-
-    row_ind, col_ind = linear_sum_assignment(count_matrix.max() - count_matrix)
-    reassignment = dict(zip(row_ind, col_ind))
-    accuracy = count_matrix[row_ind, col_ind].sum() / y_predicted.size
-    return reassignment, accuracy
-
-
-def create_hard_labels(embedding, centers, y_obs, yhat_hist, w_yhat, w_c, w_obs, classes):
-    # TODO: add label temporal dynamics
-
-    # yhat from previous metwork prediction. - Network Ensemble
-    # TODO: weighted average. Exponential decay??
-    decay = np.arange(yhat_hist.size(-1))
-    decay = -decay / yhat_hist.size(-1) + 1
-    decay = torch.Tensor(decay).to(device)
-    yhat_hist = yhat_hist * decay
-    yhat = yhat_hist.mean(dim=-1) * w_yhat
-
-    # Label from clustering
-    distance_centers = torch.cdist(embedding, centers)
-    yc = F.softmin(distance_centers, dim=1).detach() * w_c
-
-    # Observed - given - label (noisy)
-    yobs = F.one_hot(y_obs, num_classes=classes).float() * w_obs
-
-    # Label combining
-    ystar = (yhat + yc + yobs) / 3
-    ystar = torch.argmax(ystar, dim=1)
-    return ystar
-
-
-def plot_pred_labels(y_true, y_hat, accuracy, residuals=None, dataset='Train', saver=None):
-    # TODO: add more metrics
-    # Plot data as timeseries
-    gridspec_kw = {'width_ratios': [1], 'height_ratios': [3, 1]}
-
-    if residuals is not None:
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex='all', gridspec_kw=gridspec_kw)
-
-        ax2.plot(residuals ** 2, marker='o', color='red', label='Squared Residual Error', alpha=0.5, markersize='2')
-        # ax2.set_ylim([0, 1])
-        ax2.grid(True)
-        ax2.legend(loc=1)
+def mixup_data_Boot(x, y, alpha=1.0, device='cuda'):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
     else:
-        fig, ax1 = plt.subplots(1, 1, figsize=(15, 10))
+        lam = 1
 
-    ax1.plot(y_true.ravel(), linestyle='-', marker='o', color='black', label='True', markersize='2')
-    ax1.plot(y_hat.ravel(), linestyle='--', marker='o', color='red', label='Prediction', alpha=0.5,
-             markersize='2')
-    ax1.set_title('%s data: top1 acc: %.4f' % (dataset, accuracy))
-    ax1.legend(loc=1)
+    batch_size = x.size()[0]
+    if device == 'cuda':
+        index = torch.randperm(batch_size).to(device)
+    else:
+        index = torch.randperm(batch_size)
 
-    fig.tight_layout()
-    saver.save_fig(fig, name='%s series' % dataset)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam, index
 
+
+def train_mixUp_HardBootBeta(args, model, device, train_loader, optimizer, epoch, alpha, bmm_model, \
+                             bmm_model_maxLoss, bmm_model_minLoss, reg_term, num_classes):
+    model.train()
+    loss_per_batch = []
+
+    acc_train_per_batch = []
+    correct = 0
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        output_x1 = model(data)
+        # output_x1.detach_()
+        optimizer.zero_grad()
+
+        inputs_mixed, targets_1, targets_2, lam, index = mixup_data_Boot(data, target, alpha, device)
+        output = model(inputs_mixed)
+        output_mean = F.softmax(output, dim=1)
+        tab_mean_class = torch.mean(output_mean, -2)
+        output = F.log_softmax(output, dim=1)
+
+        B = compute_probabilities_batch(data, target, model, bmm_model, bmm_model_maxLoss, bmm_model_minLoss)
+        B = B.to(device)
+        B[B <= 1e-4] = 1e-4
+        B[B >= 1 - 1e-4] = 1 - 1e-4
+
+        output_x1 = F.log_softmax(output_x1, dim=1)
+        output_x2 = output_x1[index, :]
+        B2 = B[index]
+
+        z1 = torch.max(output_x1, dim=1)[1]
+        z2 = torch.max(output_x2, dim=1)[1]
+
+        loss_x1_vec = (1 - B) * F.nll_loss(output, targets_1, reduction='none')
+        loss_x1 = torch.sum(loss_x1_vec) / len(loss_x1_vec)
+
+        loss_x1_pred_vec = B * F.nll_loss(output, z1, reduction='none')
+        loss_x1_pred = torch.sum(loss_x1_pred_vec) / len(loss_x1_pred_vec)
+
+        loss_x2_vec = (1 - B2) * F.nll_loss(output, targets_2, reduction='none')
+        loss_x2 = torch.sum(loss_x2_vec) / len(loss_x2_vec)
+
+        loss_x2_pred_vec = B2 * F.nll_loss(output, z2, reduction='none')
+        loss_x2_pred = torch.sum(loss_x2_pred_vec) / len(loss_x2_pred_vec)
+
+        loss = lam * (loss_x1 + loss_x1_pred) + (1 - lam) * (loss_x2 + loss_x2_pred)
+
+        loss_reg = reg_loss_class(tab_mean_class, num_classes)
+        loss = loss + reg_term * loss_reg
+
+        loss.backward()
+
+        optimizer.step()
+        ################## monitor losses  ####################################
+        loss_per_batch.append(loss.item())
+        ########################################################################
+
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
+
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item(),
+                       100. * correct / ((batch_idx + 1) * args.batch_size),
+                optimizer.param_groups[0]['lr']))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+    return (loss_per_epoch, acc_train_per_epoch)
+
+
+##############################################################################
+
+
+##################### Mixup Beta Soft Bootstrapping ####################
+# Mixup guided by our beta model with beta soft bootstrapping
+
+def mixup_criterion_mixSoft(pred, y_a, y_b, B, lam, index, output_x1, output_x2):
+    return torch.sum(
+        (lam) * (
+                (1 - B) * F.nll_loss(pred, y_a, reduction='none') + B * (
+            -torch.sum(F.softmax(output_x1, dim=1) * pred, dim=1))) +
+        (1 - lam) * (
+                (1 - B[index]) * F.nll_loss(pred, y_b, reduction='none') + B[index] * (
+            -torch.sum(F.softmax(output_x2, dim=1) * pred, dim=1)))) / len(
+        pred)
+
+
+def train_mixUp_SoftBootBeta(args, model, device, train_loader, optimizer, epoch, alpha, bmm_model, bmm_model_maxLoss, \
+                             bmm_model_minLoss, reg_term, num_classes):
+    model.train()
+    loss_per_batch = []
+
+    acc_train_per_batch = []
+    correct = 0
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        output_x1 = model(data)
+        output_x1 = output_x1.detach()
+        optimizer.zero_grad()
+
+        if epoch == 1:
+            B = 0.5 * torch.ones(len(target)).float().to(device)
+        else:
+            B = compute_probabilities_batch(data, target, model, bmm_model, bmm_model_maxLoss, bmm_model_minLoss)
+            B = B.to(device)
+            B[B <= 1e-4] = 1e-4
+            B[B >= 1 - 1e-4] = 1 - 1e-4
+
+        inputs_mixed, targets_1, targets_2, lam, index = mixup_data_Boot(data, target, alpha, device)
+        output = model(inputs_mixed)
+        output_mean = F.softmax(output, dim=1)
+        output = F.log_softmax(output, dim=1)
+
+        output_x2 = output_x1[index, :]
+
+        tab_mean_class = torch.mean(output_mean, -2)  # Columns mean
+
+        loss = mixup_criterion_mixSoft(output, targets_1, targets_2, B, lam, index, output_x1,
+                                       output_x2)
+        loss_reg = reg_loss_class(tab_mean_class)
+        loss = loss + reg_term * loss_reg
+        loss.backward()
+
+        optimizer.step()
+        ################## monitor losses  ####################################
+        loss_per_batch.append(loss.item())
+        ########################################################################
+
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
+
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item(),
+                       100. * correct / ((batch_idx + 1) * args.batch_size),
+                optimizer.param_groups[0]['lr']))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+
+    return (loss_per_epoch, acc_train_per_epoch)
+
+
+##############################################################################
+
+################################ Dynamic Mixup ##################################
+# Mixup guided by our beta model
+
+def mixup_data_beta(x, y, B, device='cuda'):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+
+    batch_size = x.size()[0]
+    if device == 'cuda':
+        index = torch.randperm(batch_size).cuda()
+    else:
+        index = torch.randperm(batch_size)
+
+    lam = ((1 - B) + (1 - B[index]))
+
+    fac1 = ((1 - B) / lam)
+    fac2 = ((1 - B[index]) / lam)
+    for _ in range(x.dim() - 1):
+        fac1.unsqueeze_(1)
+        fac2.unsqueeze_(1)
+    mixed_x = fac1 * x + fac2 * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, index
+
+
+def mixup_criterion_beta(pred, y_a, y_b):
+    lam = np.random.beta(32, 32)
+    return lam * F.nll_loss(pred, y_a) + (1 - lam) * F.nll_loss(pred, y_b)
+
+
+def train_mixUp_Beta(args, model, device, train_loader, optimizer, epoch, alpha, bmm_model,
+                     bmm_model_maxLoss, bmm_model_minLoss):
+    model.train()
+    loss_per_batch = []
+
+    acc_train_per_batch = []
+    correct = 0
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        if epoch == 1:
+            B = 0.5 * torch.ones(len(target)).float().to(device)
+        else:
+            B = compute_probabilities_batch(data, target, model, bmm_model, bmm_model_maxLoss, bmm_model_minLoss)
+            B = B.to(device)
+            B[B <= 1e-4] = 1e-4
+            B[B >= 1 - 1e-4] = 1 - 1e-4
+
+        inputs_mixed, targets_1, targets_2, index = mixup_data_beta(data, target, B, device)
+        output = model(inputs_mixed)
+        output = F.log_softmax(output, dim=1)
+
+        loss = mixup_criterion_beta(output, targets_1, targets_2)
+
+        loss.backward()
+
+        optimizer.step()
+        ################## monitor losses  ####################################
+        loss_per_batch.append(loss.item())
+        ########################################################################
+
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
+
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                       100. * batch_idx / len(train_loader), loss.item(),
+                       100. * correct / ((batch_idx + 1) * args.batch_size),
+                optimizer.param_groups[0]['lr']))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+    return (loss_per_epoch, acc_train_per_epoch)
+
+
+################################################################################
+
+
+################## Dynamic Mixup + soft2hard bootstraping ##################
+def mixup_criterion_SoftHard(pred, y_a, y_b, B, index, output_x1, output_x2, Temp):
+    return torch.sum(
+        (0.5) * (
+                (1 - B) * F.nll_loss(pred, y_a, reduction='none') + B * (
+            -torch.sum(F.softmax(output_x1 / Temp, dim=1) * pred, dim=1))) +
+        (0.5) * (
+                (1 - B[index]) * F.nll_loss(pred, y_b, reduction='none') + B[index] * (
+            -torch.sum(F.softmax(output_x2 / Temp, dim=1) * pred, dim=1)))) / len(
+        pred)
+
+
+def train_mixUp_SoftHardBetaDouble(args, model, device, train_loader, optimizer, epoch, bmm_model, \
+                                   bmm_model_maxLoss, bmm_model_minLoss, countTemp, k, temp_length, reg_term,
+                                   num_classes):
+    model.train()
+    loss_per_batch = []
+
+    acc_train_per_batch = []
+    correct = 0
+    steps_every_n = 2  # 2 means that every epoch we change the value of k (index)
+    temp_vec = np.linspace(1, 0.001, temp_length)
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        output_x1 = model(data)
+        output_x1 = output_x1.detach()
+        optimizer.zero_grad()
+
+        if epoch == 1:
+            B = 0.5 * torch.ones(len(target)).float().to(device)
+        else:
+            B = compute_probabilities_batch(data, target, model, bmm_model, bmm_model_maxLoss, bmm_model_minLoss)
+            B = B.to(device)
+            B[B <= 1e-4] = 1e-4
+            B[B >= 1 - 1e-4] = 1 - 1e-4
+
+        inputs_mixed, targets_1, targets_2, index = mixup_data_beta(data, target, B, device)
+        output = model(inputs_mixed)
+        output_mean = F.softmax(output, dim=1)
+        output = F.log_softmax(output, dim=1)
+
+        output_x2 = output_x1[index, :]
+        tab_mean_class = torch.mean(output_mean, -2)
+
+        Temp = temp_vec[k]
+
+        loss = mixup_criterion_SoftHard(output, targets_1, targets_2, B, index, output_x1, output_x2, Temp)
+        loss_reg = reg_loss_class(tab_mean_class, num_classes)
+        loss = loss + reg_term * loss_reg
+
+        loss.backward()
+
+        optimizer.step()
+        ################## monitor losses  ####################################
+        loss_per_batch.append(loss.item())
+        ########################################################################
+
+        # save accuracy:
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        acc_train_per_batch.append(100. * correct / ((batch_idx + 1) * args.batch_size))
+
+        if batch_idx % args.log_interval == 0:
+            print(
+                'Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}, Accuracy: {:.0f}%, Learning rate: {:.6f}, Temperature: {:.4f}'.format(
+                    epoch, batch_idx * len(data), len(train_loader.dataset),
+                           100. * batch_idx / len(train_loader), loss.item(),
+                           100. * correct / ((batch_idx + 1) * args.batch_size),
+                    optimizer.param_groups[0]['lr'], Temp))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_train_per_epoch = [np.average(acc_train_per_batch)]
+
+    countTemp = countTemp + 1
+    if countTemp == steps_every_n:
+        k = k + 1
+        k = min(k, len(temp_vec) - 1)
+        countTemp = 1
+
+    return (loss_per_epoch, acc_train_per_epoch, countTemp, k)
+
+
+########################################################################
+
+
+def compute_probabilities_batch(data, target, cnn_model, bmm_model, bmm_model_maxLoss, bmm_model_minLoss):
+    cnn_model.eval()
+    outputs = cnn_model(data)
+    outputs = F.log_softmax(outputs, dim=1)
+    batch_losses = F.nll_loss(outputs.float(), target, reduction='none')
+    batch_losses.detach_()
+    outputs.detach_()
+    cnn_model.train()
+    batch_losses = (batch_losses - bmm_model_minLoss) / (bmm_model_maxLoss - bmm_model_minLoss + 1e-6)
+    batch_losses[batch_losses >= 1] = 1 - 10e-4
+    batch_losses[batch_losses <= 0] = 10e-4
+
+    # B = bmm_model.posterior(batch_losses,1)
+    B = bmm_model.look_lookup(batch_losses, bmm_model_maxLoss, bmm_model_minLoss)
+
+    return torch.FloatTensor(B)
+
+
+def test_cleaning(args, model, device, test_loader):
+    model.eval()
+    loss_per_batch = []
+    acc_val_per_batch = []
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(test_loader):
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            output = F.log_softmax(output, dim=1)
+            test_loss += F.nll_loss(output, target, reduction='sum').item()
+            loss_per_batch.append(F.nll_loss(output, target).item())
+            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            acc_val_per_batch.append(100. * correct / ((batch_idx + 1) * args.test_batch_size))
+
+    test_loss /= len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    # acc_val_per_epoch = [np.average(acc_val_per_batch)]
+    acc_val_per_epoch = [np.array(100. * correct / len(test_loader.dataset))]
+
+    return (loss_per_epoch, acc_val_per_epoch)
+
+
+def compute_loss_set(args, model, device, data_loader):
+    model.eval()
+    all_losses = torch.Tensor()
+    for batch_idx, (data, target) in enumerate(data_loader):
+        prediction = model(data.to(device))
+        prediction = F.log_softmax(prediction, dim=1)
+        idx_loss = F.nll_loss(prediction.float(), target.to(device), reduction='none')
+        idx_loss.detach_()
+        all_losses = torch.cat((all_losses, idx_loss.cpu()))
+    return all_losses.data.numpy()
+
+
+def val_cleaning(args, model, device, val_loader):
+    model.eval()
+    loss_per_batch = []
+    acc_val_per_batch = []
+    val_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(val_loader):
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            output = F.log_softmax(output, dim=1)
+            val_loss += F.nll_loss(output, target, reduction='sum').item()
+            loss_per_batch.append(F.nll_loss(output, target).item())
+            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
+            acc_val_per_batch.append(100. * correct / ((batch_idx + 1) * args.val_batch_size))
+
+    val_loss /= len(val_loader.dataset)
+    print('\nValidation set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        val_loss, correct, len(val_loader.dataset),
+        100. * correct / len(val_loader.dataset)))
+
+    loss_per_epoch = [np.average(loss_per_batch)]
+    acc_val_per_epoch = [np.average(acc_val_per_batch)]
+    return (loss_per_epoch, acc_val_per_epoch)
+
+
+################### CODE FOR THE BETA MODEL  ########################
+
+def weighted_mean(x, w):
+    return np.sum(w * x) / np.sum(w)
+
+
+def fit_beta_weighted(x, w):
+    x_bar = weighted_mean(x, w)
+    s2 = weighted_mean((x - x_bar) ** 2, w)
+    alpha = x_bar * ((x_bar * (1 - x_bar)) / s2 - 1)
+    beta = alpha * (1 - x_bar) / x_bar
+    return alpha, beta
+
+
+class BetaMixture1D(object):
+    def __init__(self, max_iters=10,
+                 alphas_init=[1, 2],
+                 betas_init=[2, 1],
+                 weights_init=[0.5, 0.5]):
+        self.alphas = np.array(alphas_init, dtype=np.float64)
+        self.betas = np.array(betas_init, dtype=np.float64)
+        self.weight = np.array(weights_init, dtype=np.float64)
+        self.max_iters = max_iters
+        self.lookup = np.zeros(100, dtype=np.float64)
+        self.lookup_resolution = 100
+        self.lookup_loss = np.zeros(100, dtype=np.float64)
+        self.eps_nan = 1e-12
+
+    def likelihood(self, x, y):
+        return stats.beta.pdf(x, self.alphas[y], self.betas[y])
+
+    def weighted_likelihood(self, x, y):
+        return self.weight[y] * self.likelihood(x, y)
+
+    def probability(self, x):
+        return sum(self.weighted_likelihood(x, y) for y in range(2))
+
+    def posterior(self, x, y):
+        return self.weighted_likelihood(x, y) / (self.probability(x) + self.eps_nan)
+
+    def responsibilities(self, x):
+        r = np.array([self.weighted_likelihood(x, i) for i in range(2)])
+        # there are ~200 samples below that value
+        r[r <= self.eps_nan] = self.eps_nan
+        r /= r.sum(axis=0)
+        return r
+
+    def score_samples(self, x):
+        return -np.log(self.probability(x))
+
+    def fit(self, x):
+        x = np.copy(x)
+
+        # EM on beta distributions unsable with x == 0 or 1
+        eps = 1e-4
+        x[x >= 1 - eps] = 1 - eps
+        x[x <= eps] = eps
+
+        for i in range(self.max_iters):
+            # E-step
+            r = self.responsibilities(x)
+
+            # M-step
+            self.alphas[0], self.betas[0] = fit_beta_weighted(x, r[0])
+            self.alphas[1], self.betas[1] = fit_beta_weighted(x, r[1])
+            self.weight = r.sum(axis=1)
+            self.weight /= self.weight.sum()
+
+        return self
+
+    def predict(self, x):
+        return self.posterior(x, 1) > 0.5
+
+    def create_lookup(self, y):
+        x_l = np.linspace(0 + self.eps_nan, 1 - self.eps_nan, self.lookup_resolution)
+        lookup_t = self.posterior(x_l, y)
+        lookup_t[np.argmax(lookup_t):] = lookup_t.max()
+        self.lookup = lookup_t
+        self.lookup_loss = x_l  # I do not use this one at the end
+
+    def look_lookup(self, x, loss_max, loss_min):
+        x_i = x.clone().cpu().numpy()
+        x_i = np.array((self.lookup_resolution * x_i).astype(int))
+        x_i[x_i < 0] = 0
+        x_i[x_i == self.lookup_resolution] = self.lookup_resolution - 1
+        return self.lookup[x_i]
+
+    def plot(self):
+        x = np.linspace(0, 1, 100)
+        plt.plot(x, self.weighted_likelihood(x, 0), label='negative')
+        plt.plot(x, self.weighted_likelihood(x, 1), label='positive')
+        plt.plot(x, self.probability(x), lw=2, label='mixture')
+
+    def __str__(self):
+        return 'BetaMixture1D(w={}, a={}, b={})'.format(self.weight, self.alphas, self.betas)
+
+
+#######################################################################################################################
+## HELPER FUNCTION CODE
+#######################################################################################################################
 
 def train_model(model, train_loader, valid_loader, test_loader, mixup, bootbeta, args, saver=None):
     network = model.get_name()
@@ -265,9 +741,9 @@ def train_model(model, train_loader, valid_loader, test_loader, mixup, bootbeta,
         columns)
     print(s)
     print('-' * shutil.get_terminal_size().columns)
-    #saver.append_str(['*' * 100, s, '*' * 100])
+    # saver.append_str(['*' * 100, s, '*' * 100])
 
-    optimizer = eval(args.optimizer)(
+    optimizer = torch.optim.Adam(
         list(filter(lambda p: p.requires_grad, model.parameters())),
         lr=args.lr, weight_decay=args.l2penalty, eps=1e-4)
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.5)
@@ -415,347 +891,6 @@ def eval_model(model, loader, list_loss, coeffs):
     return np.array(losses).mean(), 100 * np.average(accs)
 
 
-def plot_label_insight(data, target, saver=None):
-    try:
-        data = data.squeeze(-1)
-    except:
-        try:
-            data = np.hstack([(data[:, :, i]) for i in range(data.shape[2])])
-        except:
-            pass
-
-    n_classes = len(np.unique(target))
-
-    fig, axes = plt.subplots(nrows=n_classes, ncols=1, figsize=(19.20, 10.80))
-
-    # Plot class centroid / examples
-    D = {}
-    for i in np.unique(target):
-        D[i] = {'mu': np.mean(data[target == i], axis=0).ravel(),
-                'std': np.std(data[target == i], axis=0).ravel(),
-                # 'median': np.median(train_data[target_discrete == i], axis=0).ravel(),
-                }
-
-    for i in range(n_classes):
-        axes[i].plot(D[i]['mu'], '-o', label='mean', color='tab:blue')
-        # axes[i][1].plot(D[i]['median'], '-o', label='median')
-        axes[i].fill_between(range(D[i]['mu'].shape[0]), D[i]['mu'] - D[i]['std'], D[i]['mu'] + D[i]['std'],
-                             alpha=0.33, label='stddev', color='tab:green')
-        axes[i].legend(loc=1)
-        axes[i].grid()
-        axes[i].set_title('Class {}'.format(i))
-    fig.tight_layout()
-
-    if saver:
-        saver.save_fig(fig, 'Label_Insight')
-
-
-def plot_label_insight_v2(data, target_continous, train_data, target_discrete, history=36, future=6,
-                          saver=None):
-    # TODO: Remove those ugly try: exept:
-    try:
-        train_data = train_data.squeeze(-1)
-    except:
-        try:
-            train_data = np.hstack([(train_data[:, :, i]) for i in range(train_data.shape[2])])
-        except:
-            pass
-
-    n_classes = len(np.unique(target_discrete))
-    data_min = np.min(data)
-    data_max = np.max(data)
-
-    fig, axes = plt.subplots(nrows=n_classes, ncols=2, figsize=(19.20, 10.80))
-    # Plot input Data
-    gs = axes[0, 0].get_gridspec()
-    # remove the underlying axes
-    for ax in axes[:2, 0]:
-        ax.remove()
-    axdata = fig.add_subplot(gs[:2, 0])
-    axdata.plot(data[:10 * history])
-    axdata.fill_between(range(history), data_min, data_max, alpha=0.25, color='green', label='Input Window')
-    axdata.fill_between(range(history - 1, history + future), data_min, data_max, alpha=0.25, color='red',
-                        label='Target Window')
-    axdata.legend(loc=1)
-    # axdata.grid()
-    axdata.set_title('Input Data - Full Raw')
-
-    # Plot Labels
-    cmap = plt.cm.jet
-    points = 3 * history
-    gs = axes[2, 0].get_gridspec()
-    # remove the underlying axes
-    for ax in axes[2:, 0]:
-        ax.remove()
-    axtarget = fig.add_subplot(gs[2:, 0])
-    line = axtarget.scatter(np.arange(points), target_continous[:points], c=target_discrete[:points], cmap=cmap)
-    axtarget.grid()
-    plt.colorbar(line, values=np.unique(target_discrete))
-    axtarget.set_title('Target Label')
-
-    # Plot class centroid / examples
-    D = {}
-    for i in np.unique(target_discrete):
-        D[i] = {'mu': np.mean(train_data[target_discrete == i], axis=0).ravel(),
-                'std': np.std(train_data[target_discrete == i], axis=0).ravel(),
-                # 'median': np.median(train_data[target_discrete == i], axis=0).ravel(),
-                }
-
-    for i in range(n_classes):
-        axes[i][1].plot(D[i]['mu'], '-o', label='mean', color=cmap(i / (n_classes - 1)))
-        # axes[i][1].plot(D[i]['median'], '-o', label='median')
-        axes[i][1].fill_between(range(D[i]['mu'].shape[0]), D[i]['mu'] - D[i]['std'], D[i]['mu'] + D[i]['std'],
-                                alpha=0.33, label='stddev', color=cmap(i / (n_classes - 1)))
-        axes[i][1].legend(loc=1)
-        axes[i][1].grid()
-        axes[i][1].set_title('Class {}'.format(i))
-    fig.tight_layout()
-
-    if saver:
-        saver.save_fig(fig, 'Label_Insight')
-
-
-def plot_test_reuslts(test: dict, test_correct: dict, ni_list: list, classes: int, network: str, mixup: str,
-                      bootbeta: str,
-                      seed: int, saver: object) -> None:
-    if test.keys() != test_correct.keys():
-        print('Plain and Corrected dict_keys are different. Plotting only test...')
-        test_correct = {k: [] for k in test.keys()}
-
-    n = len(test.keys())
-
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(6, 5 + (n * 0.1)), sharex='all')
-    for ax, (key, tst), tst_corr in zip(axes, test.items(), test_correct.values()):
-        ax.plot(tst, '--o', label='Test (Naive)')
-        ax.plot(tst_corr, '--s', label='Test (Corrected)')
-        ax.set_ylim([0, 1])
-
-        ax.set_ylabel('{}'.format(key))
-        ax.set_xticks([i for i in range(len(ni_list))])
-        ax.grid(True, alpha=0.2)
-        ax.legend()
-    axes[-1].set_xticklabels(ni_list)
-    axes[-1].set_xlabel('Label Noise ratio')
-    axes[0].set_title(
-        'Model:{} n_classes:{} - Mixup:{} - BootBeta:{} - rng_seed:{}'.format(network, classes, mixup, bootbeta, seed))
-    fig.tight_layout()
-
-    saver.save_fig(fig, 'run_results')
-
-
-def boxplot_results(data, keys, classes, network, mixup, bootbeta, saver):
-    n = len(keys)
-    x = 'noise'
-    hue = 'correct'
-    fig, axes = plt.subplots(nrows=n, ncols=1, figsize=(8, 7 + (n * 0.1)), sharex='all')
-    for ax, k in zip(axes, keys):
-        sns.boxplot(x=x, y=k, hue=hue, data=data, ax=ax)
-        ax.grid(True, alpha=0.2)
-    axes[0].set_title('Model:{} classes:{} - Mixup:{} - BootBeta:{}'.format(network, classes, mixup, bootbeta))
-    fig.tight_layout()
-    saver.save_fig(fig, 'boxplot')
-
-
-def plot_results(data, keys, saver, x='losses', hue='correct', col='noise', kind='box', style='whitegrid', title=None):
-    sns.set_style(style)
-    n = len(keys)
-
-    for k in keys:
-        g = sns.catplot(x=x, y=k, hue=hue, col=col, data=data, kind=kind)
-        g.set(ylim=(0, 1))
-        if title is not None:
-            g.fig.subplots_adjust(top=0.9)
-            g.fig.suptitle('{} - {}'.format(k, title))
-        saver.save_fig(g.fig, '{}_{}'.format(kind, k))
-
-
-def evaluate_model_multi(model, dataloder, y_true, x_true,
-                         metrics=('mae', 'mse', 'rmse', 'std_ae', 'smape', 'rae', 'mbrae', 'corr', 'r2')):
-    yhat = predict(model, dataloder)
-
-    # Classification
-    y_hat_proba = softmax(yhat, axis=1)
-    y_hat_labels = np.argmax(y_hat_proba, axis=1)
-
-    accuracy = accuracy_score(y_true, y_hat_labels)
-    f1_weighted = f1_score(y_true, y_hat_labels, average='weighted')
-
-    cm = confusion_matrix(y_true, y_hat_labels)
-    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-
-    report = classification_report(y_true, y_hat_labels)
-    print(report)
-
-    return report, y_hat_proba, y_hat_labels, accuracy, f1_weighted
-
-
-def evaluate_class_recons(model, x, Y, Y_clean, dataloader, ni, saver, network='Model', datatype='Train', correct=False,
-                          plt_cm=True, plt_lables=True):
-    print(f'{datatype} score')
-    if Y_clean is not None:
-        T = confusion_matrix(Y_clean, Y)
-    else:
-        T = None
-    results_dict = dict()
-
-    title_str = f'{datatype} - ratio:{ni} - correct:{str(correct)}'
-
-    results, yhat_proba, yhat, acc, f1 = evaluate_model_multi(model, dataloader, Y, x)
-
-    if plt_cm:
-        plot_cm(confusion_matrix(Y, yhat), T, network=network,
-                title_str=title_str, saver=saver)
-    if plt_lables:
-        plot_pred_labels(Y, yhat, acc, residuals=None, dataset=f'{datatype}. noise:{ni}', saver=saver)
-
-    results_dict['acc'] = acc
-    results_dict['f1_weighted'] = f1
-    #saver.append_str([f'{datatype}Set', 'Classification report:', results])
-    return results_dict
-
-
-def plot_cm(cm, T=None, network='Net', title_str='', saver=None):
-    classes = cm.shape[0]
-    acc = np.diag(cm).sum() / cm.sum()
-    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-
-    if T is not None:
-        fig, (ax, ax2) = plt.subplots(nrows=2, ncols=1, figsize=(4 + classes / 2.5, 4 + classes / 1.25))
-        T_norm = T.astype('float') / T.sum(axis=1)[:, np.newaxis]
-        # Transition matrix ax
-        sns.heatmap(T_norm, annot=T_norm, cmap=plt.cm.YlGnBu, cbar=False, ax=ax2, linecolor='black', linewidths=0)
-        ax2.set(ylabel='Noise Transition Matrix')
-    else:
-        fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(4 + classes / 2.5, 4 + classes / 2.5))
-
-    # Cm Ax
-    sns.heatmap(cm_norm, annot=None, cmap=plt.cm.YlGnBu, cbar=False, ax=ax, linecolor='black', linewidths=0)
-    # ax.imshow(cm_norm, aspect='auto', interpolation='nearest', cmap=plt.cm.YlGnBu)
-    # ax.matshow(cm_norm, cmap=plt.cm.Blues)
-
-    ax.set(title=f'Model:{network} - Accuracy:{100 * acc:.1f}% - {title_str}',
-           ylabel='Confusion Matrix (Predicted / True)',
-           xlabel=None)
-    # ax.set_ylim([1.5, -0.5])
-    thresh = cm_norm.max() / 2.
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j + 0.5, i + 0.5, '%d (%.2f)' % (cm[i, j], cm_norm[i, j]),
-                    ha="center", va="center",
-                    color="white" if cm_norm[i, j] > thresh else "black")
-
-    fig.tight_layout()
-
-    if saver:
-        saver.save_fig(fig, f'CM_{title_str}')
-
-
-def plot_embedding(model, train_loader, valid_loader, Y_train_clean, Y_valid_clean, Y_train, Y_valid,
-                   saver, network='Model', correct=False):
-    print('Plot Embedding...')
-    # Embeddings
-    train_embedding = predict(model, train_loader).squeeze()
-    valid_embedding = predict(model, valid_loader).squeeze()
-    classes = len(np.unique(Y_train_clean))
-
-    ttl = f'{network} - Embedding'
-    n_comp = 2
-    if train_embedding.shape[-1] > 3:
-        from umap import UMAP
-        trs = UMAP(n_components=n_comp, n_neighbors=50, min_dist=0.01, metric='euclidean')
-        ttl = 'UMAP'
-        train_embedding2d = trs.fit_transform(train_embedding)
-        valid_embedding2d = trs.transform(valid_embedding)
-    else:
-        train_embedding2d = train_embedding
-        valid_embedding2d = valid_embedding
-
-    cmap = 'jet'
-    COL = MplColorHelper(cmap, 0, classes)
-
-    plt.figure(figsize=(8, 6))
-    if train_embedding2d.shape[1] == 3:
-        ax = plt.axes(projection='3d')
-    else:
-        ax = plt.axes()
-    l0 = ax.scatter(*train_embedding2d.T, s=50, alpha=0.5, marker='.', label='Train',
-                    c=COL.get_rgb(Y_train_clean),
-                    edgecolors=COL.get_rgb(Y_train))
-    l1 = ax.scatter(*valid_embedding2d.T, s=50, alpha=0.5, marker='^', label='Valid',
-                    c=COL.get_rgb(Y_valid_clean),
-                    edgecolors=COL.get_rgb(Y_valid))
-    lines = [l0, l1] + [Line2D([0], [0], marker='o', linestyle='', color=c, markersize=10) for c in
-                        [COL.get_rgb(i) for i in np.unique(Y_train_clean.astype(int))]]
-    labels = [l0.get_label(), l1.get_label()] + [i for i in range(len(lines))]
-    ax.legend(lines, labels)
-    ax.set_title(ttl)
-    plt.tight_layout()
-    saver.save_fig(plt.gcf(), name=f'{network}_latent_{str(correct)}')
-
-
-def plot_hists_ephocs(loss, mask, auc=False, nrows=3, ncols=3, net='MLP', classes=5, saver=None, ni=None, pred_ni=None):
-    '''
-    mask : mislabel mask. 1: wrong label, 0: correct label
-    '''
-    if auc:
-        data = loss.cumsum(axis=0)
-        data_type = 'AUC'
-    else:
-        data = loss
-        data_type = 'LOSS'
-
-    plots = int(nrows * ncols)
-    epochs = data.shape[0]
-
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(19.20, 10.80))
-    for i, ax in enumerate(axes.flatten()):
-        id = int((epochs - 1) * i * (1 / (plots - 1)))
-        sns.distplot(data[id], kde=True, hist=False, rug=False, ax=ax,
-                     label='Joint', kde_kws={"color": "black", "linestyle": "--", "lw": 4})
-        sns.distplot(data[id][~mask.astype(bool)], kde=False, hist=True, rug=False, norm_hist=True, ax=ax,
-                     label='Clean', kde_kws={'alpha': 0.6, "lw": 3, 'color': 'tab:blue'},
-                     hist_kws={'alpha': 0.3, 'color': 'tab:blue'})
-        sns.distplot(data[id][mask.astype(bool)], kde=False, hist=True, rug=False, norm_hist=True, ax=ax,
-                     label='Mislabled', kde_kws={'alpha': 0.6, "lw": 3, 'color': 'tab:orange'},
-                     hist_kws={'alpha': 0.3, 'color': 'tab:orange'})
-        ax.legend()
-        ax.set(title=f'Epoch {id + 1}/{epochs} ({i * (100 / (plots - 1)):.1f}%)')
-    fig.suptitle(
-        'TRAINING {} - Net:{} - Classes:{} - True error_rate:{}. Predicted:{:.3f}'.format(data_type, net, classes, ni,
-                                                                                          pred_ni))
-    fig.tight_layout()
-    if saver:
-        saver.save_fig(fig, '{}_dist'.format(data_type))
-
-
-def visualize_training_loss(train_losses, train_idxs, mask_train, network, classes, ni, saver, correct=False):
-    print('Visualize training losses..')
-    train_losses = np.array([train_losses[i][train_idxs.argsort()[i]] for i in range(len(train_idxs))])
-
-    plot_hists_ephocs(train_losses, mask_train, auc=False, nrows=3, ncols=3, net=network, classes=classes,
-                      saver=saver, ni=ni, pred_ni=0)
-
-    ### Sample Loss
-    fig, ax = plt.subplots()
-    clean_med = np.median(train_losses[:, ~mask_train.astype(bool)], axis=1)
-    clean_q75, clean_q25 = np.percentile(train_losses[:, ~mask_train.astype(bool)], [75, 25], axis=1)
-    mislabled_med = np.median(train_losses[:, mask_train.astype(bool)], axis=1)
-    mislabled_q75, mislabled_q25 = np.percentile(train_losses[:, mask_train.astype(bool)], [75, 25], axis=1)
-
-    ax.plot(clean_med, label='Clean', color='tab:blue')
-    ax.fill_between(range(clean_med.shape[0]), clean_q25, clean_q75, alpha=0.25,
-                    color='tab:blue')
-    ax.plot(mislabled_med, label='Mislabled', color='tab:orange')
-    ax.fill_between(range(mislabled_med.shape[0]), mislabled_q75, mislabled_q25,
-                    alpha=0.25, color='tab:orange')
-    ax.set(title=r'Train Loss function (median $\pm$ IRQ25:75) - noise_ratio:{}'.format(ni),
-           xlabel='Epochs',
-           ylabel=r'$\mathcal{L}_c(x, y)$')
-    ax.grid()
-    ax.legend()
-    saver.save_fig(fig, f'Loss_{ni}_{str(correct)}')
-
-
 def train_eval_model(model, x_train, x_valid, x_test, Y_train, Y_valid, Y_test, Y_train_clean, Y_valid_clean,
                      ni, args, mixup, bootbeta, saver, correct_labels=True, plt_embedding=True, plt_cm=True):
     train_dataset = TensorDataset(torch.from_numpy(x_train).float(), torch.from_numpy(Y_train).long())
@@ -777,35 +912,20 @@ def train_eval_model(model, x_train, x_valid, x_test, Y_train, Y_valid, Y_test, 
     print('Train ended')
 
     ######################################################################################################
-    train_results = evaluate_class_recons(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
-                                          args.network, 'Train', correct_labels, plt_cm=plt_cm, plt_lables=False)
-    valid_results = evaluate_class_recons(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
-                                          args.network, 'Valid', correct_labels, plt_cm=plt_cm, plt_lables=False)
-    test_results = evaluate_class_recons(model, x_test, Y_test, None, test_loader, ni, saver, args.network,
+    train_results = evaluate_class(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
+                                          'CNN', 'Train', correct_labels, plt_cm=plt_cm, plt_lables=False)
+    valid_results = evaluate_class(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
+                                          'CNN', 'Valid', correct_labels, plt_cm=plt_cm, plt_lables=False)
+    test_results = evaluate_class(model, x_test, Y_test, None, test_loader, ni, saver, 'CNN',
                                          'Test', correct_labels, plt_cm=plt_cm, plt_lables=False)
 
     if plt_embedding and args.embedding_size <= 3:
         plot_embedding(model.encoder, train_eval_loader, valid_loader, Y_train_clean, Y_valid_clean,
-                       Y_train, Y_valid, network=args.network, saver=saver, correct=correct_labels)
+                       Y_train, Y_valid, network='CNN', saver=saver, correct=correct_labels)
 
     plt.close('all')
     torch.cuda.empty_cache()
     return train_results, valid_results, test_results
-
-
-def mapper(x):
-    if x == [0, 1, 0]:
-        return r'$\mathcal{L}_c$'
-    elif x == [1, 0, 0]:
-        return r'$\mathcal{L}_{ae}$'
-    elif x == [1, 1, 0]:
-        return r'$\mathcal{L}_c + \mathcal{L}_{ae}$'
-    elif x == [0, 1, 1]:
-        return r'$\mathcal{L}_c + \mathcal{L}_{cc}$'
-    elif x == [1, 1, 1]:
-        return r'$\mathcal{L}_c + \mathcal{L}_{ae} + \mathcal{L}_{cc}$'
-    else:
-        raise ValueError
 
 
 def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y_test_clean, saver):
@@ -815,55 +935,28 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
 
             self.path = path
             self.makedir_()
-            #self.make_log()
+            # self.make_log()
 
     classes = len(np.unique(Y_train_clean))
     args.nbins = classes
     history = x_train.shape[1]
 
     # Network definition
-    if args.nonlin_classifier:
-        classifier = NonLinClassifier(args.embedding_size, classes, d_hidd=args.classifier_dim, dropout=args.dropout,
-                                      norm=args.normalization)
-    else:
-        classifier = LinClassifier(args.embedding_size, classes)
 
-    if args.network == 'MLP':
-        # Reshape data for MLP
-        x_train = np.hstack([(x_train[:, :, i]) for i in range(x_train.shape[2])])
-        x_valid = np.hstack([(x_valid[:, :, i]) for i in range(x_valid.shape[2])])
-        x_test = np.hstack([(x_test[:, :, i]) for i in range(x_test.shape[2])])
+    classifier = NonLinClassifier(args.embedding_size, classes, d_hidd=args.classifier_dim, dropout=args.dropout,
+                                  norm=args.normalization)
 
-        model_ae = MLPAE(input_shape=x_train.shape[1], embedding_dim=args.embedding_size, hidden_neurons=args.neurons,
-                         hidd_act=eval(args.hidden_activation), dropout=args.dropout,
-                         normalization=args.normalization).to(device)
-
-    elif args.network == 'TCN':
-        stacked_layers = RF_check(args.kernel_size, args.stack, history)
-
-        model_ae = TCNAE(input_size=x_train.shape[2], num_filters=args.filter_number, embedding_dim=args.embedding_size,
-                         seq_len=x_train.shape[1], num_stack=stacked_layers, kernel_size=args.kernel_size,
-                         dropout=args.dropout, normalization=args.normalization).to(device)
-
-    elif args.network == 'CNN':
-        model_ae = CNNAE(input_size=x_train.shape[2], num_filters=args.filters, embedding_dim=args.embedding_size,
-                         seq_len=x_train.shape[1], kernel_size=args.kernel_size, stride=args.stride,
-                         padding=args.padding, dropout=args.dropout, normalization=args.normalization)
-
-    elif args.network == 'LSTM':
-        # TODO: fix
-        model_ae = LSTMAE(seq_len_out=x_train.shape[1], n_features=x_train.shape[2],
-                          n_layers=args.rnn_layers, embedding_dim=args.embedding_size).to(device)
-    else:
-        raise NotImplementedError
+    model_ae = CNNAE(input_size=x_train.shape[2], num_filters=args.filters, embedding_dim=args.embedding_size,
+                     seq_len=x_train.shape[1], kernel_size=args.kernel_size, stride=args.stride,
+                     padding=args.padding, dropout=args.dropout, normalization=args.normalization)
 
     ######################################################################################################
     # model is multi task - AE Branch and Classification branch
-    model = MetaModel(ae=model_ae, classifier=classifier, n_out=args.n_out, name=args.network).to(device)
+    model = MetaModel(ae=model_ae, classifier=classifier, name='CNN').to(device)
     # torch.save(model.state_dict(), os.path.join(saver.path, 'initial_weight.pt'))
 
     nParams = sum([p.nelement() for p in model.parameters()])
-    s = 'MODEL: %s: Number of parameters: %s' % (args.network, readable(nParams))
+    s = 'MODEL: %s: Number of parameters: %s' % ('CNN', readable(nParams))
     print(s)
     saver.append_str([s])
 
@@ -897,7 +990,7 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
         test_results_main = collections.defaultdict(list)
         test_corrected_results_main = collections.defaultdict(list)
         saver_loop = SaverSlave(os.path.join(saver.path, f'seed_{seed}'))
-        #saver_loop.append_str(['SEED: {}'.format(seed), '\r\n'])
+        # saver_loop.append_str(['SEED: {}'.format(seed), '\r\n'])
 
         i = 0
         for ni in args.ni:
@@ -910,7 +1003,7 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
                 print('Label noise ratio: %.3f' % ni)
                 print('Correct labels:', correct_labels)
                 print('+' * shutil.get_terminal_size().columns)
-                #saver.append_str(['#' * 100, 'Label noise ratio: %f' % ni, 'Correct Labels: %s' % correct_labels])
+                # saver.append_str(['#' * 100, 'Label noise ratio: %f' % ni, 'Correct Labels: %s' % correct_labels])
 
                 reset_seed_(seed)
                 model = reset_model(model)
@@ -940,31 +1033,30 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
                                                                               plt_cm=args.plt_cm)
 
                 keys = list(test_results.keys())
-                test_results['noise'] = ni*.01
+                test_results['noise'] = ni * .01
                 test_results['seed'] = seed
                 test_results['correct'] = str(correct_labels)
-                test_results['losses'] = mapper(args.abg)
-                #saver_loop.append_str(['Test Results:'])
-                #saver_loop.append_dict(test_results)
+                test_results['losses'] = map_abg([0, 1, 0])
                 df_results = df_results.append(test_results, ignore_index=True)
 
         if args.plt_cm:
-            fig_title = f"Dataset: {args.dataset} - Model: {args.network} - classes:{classes} - runs:{args.n_runs} " \
+            fig_title = f"Dataset: {args.dataset} - Model: {'CNN'} - classes:{classes} - runs:{args.n_runs} " \
                         f"- MixUp:{args.Mixup} - BootBeta:{args.BootBeta}"
-            plot_results(df_results.loc[df_results.seed == seed], keys, saver_loop, x='noise', hue='correct', col='losses',
-                         kind='bar', style='whitegrid',  title=fig_title)
+            plot_results(df_results.loc[df_results.seed == seed], keys, saver_loop, x='noise', hue='correct',
+                         col='losses',
+                         kind='bar', style='whitegrid', title=fig_title)
 
     if args.plt_cm:
         # Losses column should  not change here
-        fig_title = f"Dataset: {args.dataset} - Model: {args.network} - classes:{classes} - runs:{args.n_runs} " \
+        fig_title = f"Dataset: {args.dataset} - Model: {'CNN'} - classes:{classes} - runs:{args.n_runs} " \
                     f"- MixUp:{args.Mixup} - BootBeta:{args.BootBeta}"
         plot_results(df_results, keys, saver, x='noise', hue='correct', col='losses', kind='box', style='whitegrid',
                      title=fig_title)
 
-    #boxplot_results(df_results, keys, classes, args.network, args.Mixup, args.BootBeta, saver)
+    # boxplot_results(df_results, keys, classes, 'CNN', args.Mixup, args.BootBeta, saver)
 
-    #results_summary = df_results.groupby(['noise', 'correct'])[keys].describe().T
-    #saver.append_str(['Results main summary', results_summary])
+    # results_summary = df_results.groupby(['noise', 'correct'])[keys].describe().T
+    # saver.append_str(['Results main summary', results_summary])
 
     remove_empty_dirs(saver.path)
 

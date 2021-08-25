@@ -59,7 +59,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='SREA hyperparameter ablation with UCR datasets.'
                     'Each hyperpar is passed as a list a a grid with all the combination is exploited.'
-                    '')
+                    'Parallel implementation on single GPU.')
 
     # Synth Data
     parser.add_argument('--dataset', type=str, default='CBF', help='UCR datasets')
@@ -69,7 +69,9 @@ def parse_args():
                                                                    'number as str for time-dependent noise')
 
     parser.add_argument('--M', type=int, nargs='+', default=[20, 40, 60, 80])
-    parser.add_argument('--abg', type=float, nargs='+', default=None)  # AE - Classification - Cluster
+    parser.add_argument('--abg', type=float, nargs='+', default=None,
+                        help='Loss function coefficients. a (alpha) = AE, b (beta) = classifier, g (gamma) = clusterer'
+                             'Set to None to iterate on all combination of a/b/g.')
     parser.add_argument('--class_reg', type=int, default=1, help='Distribution regularization coeff')
     parser.add_argument('--entropy_reg', type=int, default=0, help='Entropy regularization coeff')
 
@@ -95,7 +97,7 @@ def parse_args():
     parser.add_argument('--l2penalty', type=float, default=1e-4)
 
     parser.add_argument('--num_workers', type=int, default=0, help='PyTorch dataloader worker. Set to 0 if debug.')
-    parser.add_argument('--init_seed', type=int, default=0, help='RNG seed. Typ. 42, 420, 1337, 0, 69.')
+    parser.add_argument('--init_seed', type=int, default=0, help='RNG seed.')
     parser.add_argument('--n_runs', type=int, default=2, help='Number of runs')
     parser.add_argument('--process', type=int, default=2, help='Number of parallel process. Single GPU.')
 
