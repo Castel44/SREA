@@ -4,19 +4,21 @@ import warnings
 import shutil
 import itertools
 import time
-from datetime import datetime
-
 import copy
+
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+
 import torch.multiprocessing as mp
 
-from src.utils.new_dataload import OUTPATH
 from src.utils.saver import Saver
-from src.utils.training_helper_v2 import single_experiment_ucr, map_losstype, map_abg_main
+from src.utils.global_var import OUTPATH
+from src.utils.SREA_utils import single_experiment_SREA
+from src.utils.utils import str2bool, map_abg_main, map_losstype, check_ziplen, remove_duplicates
 
 ######################################################################################################
 
@@ -30,40 +32,6 @@ pd.set_option('display.width', None)
 
 
 ######################################################################################################
-class SaverSlave(Saver):
-    def __init__(self, path):
-        super(Saver)
-
-        self.path = path
-        self.makedir_()
-        self.make_log()
-
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
-
-def check_ziplen(l, n):
-    if len(l) % n != 0:
-        l += [l[-1]]
-        return check_ziplen(l, n)
-    else:
-        return l
-
-
-def remove_duplicates(sequence):
-    unique = []
-    [unique.append(item) for item in sequence if item not in unique]
-    return unique
-
-
 def run(x, args, path, result_path, id):
     print('Process PID:', os.getpid())
     track, init_centers, delta_start, delta_end, abg = x
@@ -72,11 +40,11 @@ def run(x, args, path, result_path, id):
     args.init_centers = init_centers
     args.correct_start = init_centers + delta_start
     args.correct_end = init_centers + delta_start + delta_end
-    args.delta_init = delta_start
+    args.delta_start = delta_start
     args.delta_end = delta_end
     args.id = id
 
-    df_run = single_experiment_ucr(args, path)
+    df_run = single_experiment_SREA(args, path)
     if os.path.exists(result_path):
         df_run.to_csv(result_path, mode='a', sep=',', header=False, index=False)
     else:
@@ -84,27 +52,21 @@ def run(x, args, path, result_path, id):
 
 
 def parse_args():
-    # TODO: make external configuration file -json or similar.
     """
     Parse arguments
     """
-    # List handling: https://stackoverflow.com/questions/15753701/how-can-i-pass-a-list-as-a-command-line-argument-with-argparse
-
     # Add global parameters
-    parser = argparse.ArgumentParser(description='UCR Classification')
+    parser = argparse.ArgumentParser(
+        description='SREA hyperparameter ablation with UCR datasets.'
+                    'Each hyperpar is passed as a list a a grid with all the combination is exploited.'
+                    '')
 
     # Synth Data
     parser.add_argument('--dataset', type=str, default='CBF', help='UCR datasets')
-    parser.add_argument('--data_split', type=str, default='random20', choices=['original', 'random20'],
-                        help='train-test splitting strategy')
-    parser.add_argument('--weighted', action='store_true', default=True)
-    parser.add_argument('--sigma', type=float, default=0.0, help='Additive noise')
 
-    parser.add_argument('--ni', type=float, nargs='+', default=[0.6], help='label noise ratio')
+    parser.add_argument('--ni', type=float, nargs='+', default=[0.2, 0.6], help='label noise ratio')
     parser.add_argument('--label_noise', type=int, default=0, help='Label noise type, sym or int for asymmetric, '
-                                                         'number as str for time-dependent noise')
-
-    parser.add_argument('--n_out', type=int, default=1, help='Output Heads')
+                                                                   'number as str for time-dependent noise')
 
     parser.add_argument('--M', type=int, nargs='+', default=[20, 40, 60, 80])
     parser.add_argument('--abg', type=float, nargs='+', default=None)  # AE - Classification - Cluster
@@ -121,8 +83,6 @@ def parse_args():
     parser.add_argument('--preprocessing', type=str, default='StandardScaler',
                         help='Any available preprocessing method from sklearn.preprocessing')
 
-    parser.add_argument('--network', type=str, default='CNN',
-                        help='Available networks: TCN, MLP, LSTM')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--learning_rate', type=float, default=1e-2)
@@ -130,21 +90,14 @@ def parse_args():
     parser.add_argument('--hidden_activation', type=str, default='nn.ReLU()')
     parser.add_argument('--gradient_clip', type=float, default=-1)
 
-    parser.add_argument('--optimizer', type=str, default='torch.optim.Adam')
-    parser.add_argument('--class_loss', type=str, default='CrossEntropy',
-                        choices=['CrossEntropy', 'Taylor', 'GeneralizedCE', 'Unhinged', 'PHuber', 'PHuberGeneralized'])
-
     parser.add_argument('--normalization', type=str, default='batch')
     parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--l2penalty', type=float, default=1e-4)
 
-    parser.add_argument('--metrics', nargs='+',  # TODO
-                        default=('acc', 'prec', 'rec'))
-
     parser.add_argument('--num_workers', type=int, default=0, help='PyTorch dataloader worker. Set to 0 if debug.')
     parser.add_argument('--init_seed', type=int, default=0, help='RNG seed. Typ. 42, 420, 1337, 0, 69.')
     parser.add_argument('--n_runs', type=int, default=2, help='Number of runs')
-    parser.add_argument('--process', type=int, default=3, help='Number of parallel process. Single GPU.')
+    parser.add_argument('--process', type=int, default=2, help='Number of parallel process. Single GPU.')
 
     parser.add_argument('--nonlin_classifier', action='store_true', default=True, help='Final Classifier')
     parser.add_argument('--classifier_dim', type=int, default=128)
@@ -155,15 +108,6 @@ def parse_args():
     parser.add_argument('--filters', nargs='+', type=int, default=[128, 128, 256, 256])
     parser.add_argument('--stride', type=int, default=2)
     parser.add_argument('--padding', type=int, default=2)
-
-    ## TCN
-    #parser.add_argument('--stack', type=int, default=4)
-    #parser.add_argument('--filter_number', type=int, default=64)
-    ## RECURRENT
-    #parser.add_argument('--rnn_layers', type=int, default=2)
-    #parser.add_argument('--rnn_units', type=int, default=128)
-    # MLP
-    parser.add_argument('--neurons', nargs='+', type=int, default=[128, 128, 128])
 
     # Suppress terminal out
     parser.add_argument('--disable_print', action='store_true', default=True)
@@ -203,10 +147,9 @@ def main():
     ######################################################################################################
     # LOG STUFF
     # Declare saver object
-    # TODO: make hierarcy explicit. Now its tweaked in network
     saver = Saver(OUTPATH, os.path.basename(__file__).split(sep='.py')[0],
-                  network=os.path.join(args.dataset, args.network, map_losstype(args.label_noise),
-                                       map_abg_main(args.abg)))
+                  hierarchy=os.path.join(args.dataset, map_losstype(args.label_noise),
+                                         map_abg_main(args.abg)))
     saver.make_log(**vars(args))
 
     ######################################################################################################
@@ -279,29 +222,6 @@ def main():
     print('{} - Experiment took: {}'.format(end_datetime.strftime("%d/%m/%Y %H:%M:%S"),
                                             time.strftime("%Hh:%Mm:%Ss", time.gmtime(total_seconds))))
     print(f'results dataframe saved in: {csv_path}')
-
-    # nunique = list(df_results.nunique().keys()[df_results.nunique() == 1])
-    # nunique = {k: v for k, v in
-    #           zip(nunique, df_results[nunique].iloc[0].values)}
-    # keys = ['acc']
-
-
-#
-# def drop_constant_column(dataframe):
-#    """
-#    Drops constant value columns of pandas dataframe.
-#    """
-#    return dataframe.loc[:, (dataframe != dataframe.iloc[0]).any()]
-#
-# df = drop_constant_column(df_results)
-#
-## Losses column should  not change here
-# fig_title = f"Dataset:{args.dataset} - Model: {args.network} - classes:{args.nbins}"
-# plot_results(df_results, keys, saver, title=fig_title,
-#             x='init_centers', hue='track', col='noise', kind='box', style='whitegrid')
-
-# results_summary = df_results.groupby(['noise', 'correct', 'losses'])[keys].describe().T
-# saver.append_str(['Results main summary', str(results_summary)])
 
 
 ######################################################################################################

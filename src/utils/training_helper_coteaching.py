@@ -14,7 +14,7 @@ from matplotlib import cm
 from matplotlib import pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.models.AEs import MLPAE, TCNAE, LSTMAE, CNNAE
+from src.models.model import MLPAE, TCNAE, LSTMAE, CNNAE
 from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
 from src.utils.saver import Saver
 from src.utils.training_helper_utils import reset_seed_, evaluate_class_recons, plot_embedding, plot_results, columns, \

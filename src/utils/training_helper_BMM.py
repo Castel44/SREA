@@ -23,7 +23,7 @@ from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, \
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from src.models.AEs import MLPAE, TCNAE, LSTMAE, CNNAE
+from src.models.model import MLPAE, TCNAE, LSTMAE, CNNAE
 from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
 from src.utils.metrics import evaluate_multi
 from src.utils.robust_losses import TaylorCrossEntropy, Unhinged, PHuberCrossEntropy, PHuberGeneralizedCrossEntropy, \

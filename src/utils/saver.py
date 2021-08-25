@@ -5,10 +5,10 @@ import numpy as np
 
 class Saver(object):
     # TODO: find better way to get dynamically OUTPATH without git
-    def __init__(self, OUTPATH, name, network=''):
+    def __init__(self, OUTPATH, name, hierarchy=''):
         self.out = OUTPATH
         self.name = name
-        self.network = network
+        self.hierarchy = hierarchy
 
         self.f = None
 
@@ -18,7 +18,7 @@ class Saver(object):
     def create_path_(self):
         now = datetime.now()
         now = now.isoformat().split(sep='.')[0]
-        return os.path.join(self.out, self.name, self.network, now)
+        return os.path.join(self.out, self.name, self.hierarchy, now)
 
     def makedir_(self):
         os.makedirs(self.path, exist_ok=True)

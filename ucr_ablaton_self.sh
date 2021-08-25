@@ -16,7 +16,7 @@ available_datasets=(
 )
 
 
-export PYTHONPATH=$PYTHONPATH:$(pwd)
+export PYTHONPATH=$(pwd)
 export CUDA_VISIBLE_DEVICES=$1
 dataset=( "${@:2}" )
 
