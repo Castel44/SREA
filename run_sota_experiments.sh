@@ -1,5 +1,5 @@
 #!/bin/bash
-# example ucr_ablaton.sh GPU_NUMBER DATASET
+# example run_hyper_ablation.sh GPU_NUMBER DATASET
 
 export PYTHONPATH=$(pwd)
 export CUDA_VISIBLE_DEVICES=${1:-0}
