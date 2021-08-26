@@ -5,24 +5,18 @@ import shutil
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
+import scipy.stats as stats
 import torch
 import torch.nn.functional as F
-from matplotlib.lines import Line2D
-from scipy.special import softmax
-from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, \
-    classification_report
 from torch.autograd import Variable
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, TensorDataset
 
-import scipy.stats as stats
-
+from src.models.MultiTaskClassification import MetaModel, NonLinClassifier
 from src.models.model import CNNAE
-from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
+from src.utils.plotting_utils import plot_results, plot_embedding
 from src.utils.saver import Saver
 from src.utils.utils import readable, reset_seed_, reset_model, flip_label, map_abg, remove_empty_dirs, \
     evaluate_class
-from src.utils.plotting_utils import plot_results, plot_embedding
 
 ######################################################################################################
 columns = shutil.get_terminal_size().columns
@@ -68,7 +62,7 @@ def track_training_loss(args, model, device, train_loader, epoch, bmm_model1, bm
     bmm_model_minLoss = torch.FloatTensor([min_perc]).to(device) + 10e-6
 
     loss_tr = (loss_tr - bmm_model_minLoss.data.cpu().numpy()) / (
-                bmm_model_maxLoss.data.cpu().numpy() - bmm_model_minLoss.data.cpu().numpy() + 1e-6)
+            bmm_model_maxLoss.data.cpu().numpy() - bmm_model_minLoss.data.cpu().numpy() + 1e-6)
 
     loss_tr[loss_tr >= 1] = 1 - 10e-4
     loss_tr[loss_tr <= 0] = 10e-4
@@ -913,11 +907,11 @@ def train_eval_model(model, x_train, x_valid, x_test, Y_train, Y_valid, Y_test, 
 
     ######################################################################################################
     train_results = evaluate_class(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
-                                          'CNN', 'Train', correct_labels, plt_cm=plt_cm, plt_lables=False)
+                                   'CNN', 'Train', correct_labels, plt_cm=plt_cm, plt_lables=False)
     valid_results = evaluate_class(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
-                                          'CNN', 'Valid', correct_labels, plt_cm=plt_cm, plt_lables=False)
+                                   'CNN', 'Valid', correct_labels, plt_cm=plt_cm, plt_lables=False)
     test_results = evaluate_class(model, x_test, Y_test, None, test_loader, ni, saver, 'CNN',
-                                         'Test', correct_labels, plt_cm=plt_cm, plt_lables=False)
+                                  'Test', correct_labels, plt_cm=plt_cm, plt_lables=False)
 
     if plt_embedding and args.embedding_size <= 3:
         plot_embedding(model.encoder, train_eval_loader, valid_loader, Y_train_clean, Y_valid_clean,

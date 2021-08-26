@@ -1,23 +1,21 @@
-import os
 import argparse
-import warnings
-import shutil
-import itertools
-import time
 import copy
-
+import itertools
+import os
+import shutil
+import time
+import warnings
 from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-
 import torch.multiprocessing as mp
 
-from src.utils.saver import Saver
-from src.utils.global_var import OUTPATH
 from src.utils.SREA_utils import single_experiment_SREA
+from src.utils.global_var import OUTPATH
+from src.utils.saver import Saver
 from src.utils.utils import str2bool, map_abg_main, map_losstype, check_ziplen, remove_duplicates
 
 ######################################################################################################

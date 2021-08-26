@@ -1,26 +1,19 @@
-import subprocess
-import collections
-import itertools
-import logging
-import sys
+import argparse
 import argparse
 import os
 import shutil
-from time import time
 
 import numpy as np
 import pandas as pd
 import torch
-
 from scipy.optimize import linear_sum_assignment
 from scipy.special import softmax
 from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, \
-    classification_report, balanced_accuracy_score
-
-from src.utils.metrics import evaluate_multi
-from src.utils.saver import Saver
+    classification_report
 
 import src.utils.plotting_utils as plt
+from src.utils.metrics import evaluate_multi
+from src.utils.saver import Saver
 
 ######################################################################################################################
 columns = shutil.get_terminal_size().columns
@@ -291,7 +284,7 @@ def evaluate_class_recons(model, x, Y, Y_clean, dataloader, ni, saver, network='
 
 
 def evaluate_class(model, x, Y, Y_clean, dataloader, ni, saver, network='Model', datatype='Train', correct=False,
-                          plt_cm=True, plt_lables=True):
+                   plt_cm=True, plt_lables=True):
     print(f'{datatype} score')
     if Y_clean is not None:
         T = confusion_matrix(Y_clean, Y)
@@ -305,13 +298,13 @@ def evaluate_class(model, x, Y, Y_clean, dataloader, ni, saver, network='Model',
 
     if plt_cm:
         plt.plot_cm(confusion_matrix(Y, yhat), T, network=network,
-                title_str=title_str, saver=saver)
+                    title_str=title_str, saver=saver)
     if plt_lables:
         plt.plot_pred_labels(Y, yhat, acc, residuals=None, dataset=f'{datatype}. noise:{ni}', saver=saver)
 
     results_dict['acc'] = acc
     results_dict['f1_weighted'] = f1
-    #saver.append_str([f'{datatype}Set', 'Classification report:', results])
+    # saver.append_str([f'{datatype}Set', 'Classification report:', results])
     return results_dict
 
 

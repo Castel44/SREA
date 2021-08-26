@@ -1,6 +1,6 @@
-import warnings
 import functools
 import time
+import warnings
 
 import numpy as np
 
@@ -28,6 +28,7 @@ def reset_rng(func):
     """
     decorator wrapper to reset the numpy rng
     """
+
     @functools.wraps(func)
     def wrapper_decorator(*args, **kwargs):
         np.random.seed(SEED)
@@ -35,19 +36,22 @@ def reset_rng(func):
         value = func(*args, **kwargs)
         # Do something after
         return value
+
     return wrapper_decorator
 
 
 def timer(func):
     """Print the runtime of the decorated function"""
+
     @functools.wraps(func)
     def wrapper_timer(*args, **kwargs):
-        start_time = time.perf_counter()    # 1
+        start_time = time.perf_counter()  # 1
         value = func(*args, **kwargs)
-        end_time = time.perf_counter()      # 2
-        run_time = end_time - start_time    # 3
+        end_time = time.perf_counter()  # 2
+        run_time = end_time - start_time  # 3
         print(f"Finished {func.__name__!r} in {run_time:.4f} secs")
         return value
+
     return wrapper_timer
 
 
@@ -58,6 +62,7 @@ def repeat(num_times=5):
             for _ in range(num_times):
                 value = func(*args, **kwargs)
             return value
-        return wrapper_repeat
-    return decorator_repeat
 
+        return wrapper_repeat
+
+    return decorator_repeat

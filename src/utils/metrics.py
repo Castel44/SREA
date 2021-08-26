@@ -1,6 +1,8 @@
+from collections import defaultdict
+
 import numpy as np
 from tslearn.metrics import dtw as dtw_
-from collections import defaultdict
+
 EPSILON = 1e-10
 
 
@@ -31,7 +33,7 @@ def _relative_error(actual: np.ndarray, predicted: np.ndarray, benchmark: np.nda
             seasonality = 1
         else:
             seasonality = benchmark
-        return _error(actual[seasonality:], predicted[seasonality:]) /\
+        return _error(actual[seasonality:], predicted[seasonality:]) / \
                (_error(actual[seasonality:], _naive_forecasting(actual, seasonality)) + EPSILON)
 
     return _error(actual, predicted) / (_error(actual, benchmark) + EPSILON)
@@ -93,9 +95,10 @@ def mae(actual: np.ndarray, predicted: np.ndarray):
     """ Mean Absolute Error """
     return np.mean(np.abs(_error(actual, predicted)))
 
+
 def wape(actual: np.ndarray, predicted: np.ndarray):
     """ Weighted Absolute Percentage Error """
-    return mae(actual, predicted)/np.mean(actual)
+    return mae(actual, predicted) / np.mean(actual)
 
 
 mad = mae  # Mean Absolute Deviation (it is the same as MAE)
@@ -158,7 +161,6 @@ def smape(actual: np.ndarray, predicted: np.ndarray):
     mask = a.squeeze() != 0
     return (np.fabs(a - b) / a)[mask].mean()'''
 
-
 '''def smape(a, b):
     tmp = ((np.fabs(a) + np.fabs(b))/2 )
     mask = tmp != 0
@@ -195,13 +197,13 @@ def mase(actual: np.ndarray, predicted: np.ndarray, seasonality: int = 1):
 def std_ae(actual: np.ndarray, predicted: np.ndarray):
     """ Normalized Absolute Error """
     __mae = mae(actual, predicted)
-    return np.sqrt(np.sum(np.square(_error(actual, predicted) - __mae))/(len(actual) - 1))
+    return np.sqrt(np.sum(np.square(_error(actual, predicted) - __mae)) / (len(actual) - 1))
 
 
 def std_ape(actual: np.ndarray, predicted: np.ndarray):
     """ Normalized Absolute Percentage Error """
     __mape = mape(actual, predicted)
-    return np.sqrt(np.sum(np.square(_percentage_error(actual, predicted) - __mape))/(len(actual) - 1))
+    return np.sqrt(np.sum(np.square(_percentage_error(actual, predicted) - __mape)) / (len(actual) - 1))
 
 
 def rmspe(actual: np.ndarray, predicted: np.ndarray):
@@ -240,7 +242,7 @@ def rrse(actual: np.ndarray, predicted: np.ndarray):
 
 def mre(actual: np.ndarray, predicted: np.ndarray, benchmark: np.ndarray = None):
     """ Mean Relative Error """
-    return np.mean(np.abs(_error(actual, predicted))/actual)
+    return np.mean(np.abs(_error(actual, predicted)) / actual)
     # return np.mean(_relative_error(actual, predicted, benchmark))
 
 
@@ -284,7 +286,7 @@ def r2score(actual: np.ndarray, predicted: np.ndarray):
     """ Return the coefficient of determination R^2 of the prediction."""
     u = ((actual - predicted) ** 2).sum()
     v = ((actual - predicted.mean()) ** 2).sum()
-    return 1- u/(v+EPSILON)
+    return 1 - u / (v + EPSILON)
 
 
 def dtw(actual: np.ndarray, predicted: np.ndarray):
@@ -355,10 +357,11 @@ def evaluate(actual: np.ndarray, predicted: np.ndarray, metrics=('mae', 'mse', '
     return results
 
 
-def evaluate_multi(actual: np.ndarray, predicted: np.ndarray, metrics=('mae', 'mse', 'smape', 'umbrae', 'r2'), verbose=True):
+def evaluate_multi(actual: np.ndarray, predicted: np.ndarray, metrics=('mae', 'mse', 'smape', 'umbrae', 'r2'),
+                   verbose=True):
     results = defaultdict(list)
     for i in range(actual.shape[1]):
-        scores = evaluate(actual[:,i], predicted[:,i], metrics, verbose=False)
+        scores = evaluate(actual[:, i], predicted[:, i], metrics, verbose=False)
         for key in scores.keys():
             results[key].append(scores[key])
 

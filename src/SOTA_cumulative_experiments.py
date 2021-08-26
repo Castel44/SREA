@@ -1,33 +1,28 @@
-import os
 import argparse
-import warnings
-import shutil
 import copy
-from datetime import datetime
+import os
+import shutil
 import time
-
-from src.utils.global_var import OUTPATH
-
-import numpy as np
-import pandas as pd
-import torch
-
-from BMM_single_experiment import main as main_BMM
-from sigua_single_experiment import main as main_sigua
-from coteaching_single_experiment import main as main_coteaching
-
-from src.utils.saver import Saver
-from src.utils.plotting_utils import plot_results
-
-import torch.multiprocessing as mp
+import warnings
+from datetime import datetime
 
 import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
+import torch
+import torch.multiprocessing as mp
+
+from BMM_single_experiment import main as main_BMM
+from coteaching_single_experiment import main as main_coteaching
+from sigua_single_experiment import main as main_sigua
+from src.utils.global_var import OUTPATH
+from src.utils.plotting_utils import plot_results
+from src.utils.saver import Saver
 
 ######################################################################################################
 warnings.filterwarnings("ignore")
 torch.backends.cudnn.benchmark = True
 columns = shutil.get_terminal_size().columns
+
 
 ######################################################################################################
 def parse_args():
@@ -72,7 +67,6 @@ def parse_args():
     parser.add_argument('--normalization', type=str, default='batch')
     parser.add_argument('--dropout', type=float, default=0.2)
     parser.add_argument('--l2penalty', type=float, default=1e-4)
-
 
     parser.add_argument('--num_workers', type=int, default=0, help='PyTorch dataloader worker. Set to 0 if debug.')
     parser.add_argument('--seed', type=int, default=0, help='RNG seed - only affects Network init')
@@ -153,9 +147,7 @@ if __name__ == '__main__':
                                             time.strftime("%Hh:%Mm:%Ss", time.gmtime(total_seconds))))
     print(f'results dataframe saved in: {csv_path}')
 
-
     ####
     df = pd.read_csv(csv_path)
     title = "Dataset: {}".format(args.dataset)
     plot_results(df, ['acc', 'f1_weighted'], saver, x='noise', hue='correct', title=title)
-

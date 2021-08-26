@@ -3,26 +3,26 @@ import os
 import shutil
 from itertools import chain
 
-import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import torch
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
-
+from src.models.MultiTaskClassification import MetaModel, NonLinClassifier
 from src.models.model import CNNAE
-from src.models.MultiTaskClassification import MetaModel, LinClassifier, NonLinClassifier
+from src.utils.plotting_utils import plot_results, plot_embedding
 from src.utils.saver import Saver
 from src.utils.utils import readable, reset_seed_, reset_model, flip_label, map_abg, remove_empty_dirs, \
     evaluate_class
-from src.utils.plotting_utils import plot_results, plot_embedding
 
 ######################################################################################################
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 columns = shutil.get_terminal_size().columns
+
 
 ######################################################################################################
 
@@ -202,11 +202,11 @@ def train_eval_model(models, x_train, x_valid, x_test, Y_train, Y_valid, Y_test,
 
     ######################################################################################################
     train_results = evaluate_class(model, x_train, Y_train, Y_train_clean, train_eval_loader, ni, saver,
-                                          'CNN', 'Train', True, plt_cm=plt_cm, plt_lables=False)
+                                   'CNN', 'Train', True, plt_cm=plt_cm, plt_lables=False)
     valid_results = evaluate_class(model, x_valid, Y_valid, Y_valid_clean, valid_loader, ni, saver,
-                                          'CNN', 'Valid', True, plt_cm=plt_cm, plt_lables=False)
+                                   'CNN', 'Valid', True, plt_cm=plt_cm, plt_lables=False)
     test_results = evaluate_class(model, x_test, Y_test, None, test_loader, ni, saver, 'CNN',
-                                         'Test', True, plt_cm=plt_cm, plt_lables=False)
+                                  'Test', True, plt_cm=plt_cm, plt_lables=False)
 
     if plt_embedding and args.embedding_size <= 3:
         plot_embedding(model.encoder, train_eval_loader, valid_loader, Y_train_clean, Y_valid_clean,
@@ -235,7 +235,6 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
                                    norm=args.normalization)
     classifier2 = NonLinClassifier(args.embedding_size, classes, d_hidd=args.classifier_dim, dropout=args.dropout,
                                    norm=args.normalization)
-
 
     model1 = CNNAE(input_size=x_train.shape[2], num_filters=args.filters, embedding_dim=args.embedding_size,
                    seq_len=x_train.shape[1], kernel_size=args.kernel_size, stride=args.stride,

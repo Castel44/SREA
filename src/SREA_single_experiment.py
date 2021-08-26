@@ -1,22 +1,21 @@
-import os
 import argparse
 import logging
+import os
+import shutil
 import sys
 import warnings
-import shutil
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
 
-from src.utils.ucr_datasets import load_data
-from src.utils.log_utils import StreamToLogger
-from src.utils.saver import Saver
-from src.utils.global_var import OUTPATH
-from src.utils.plotting_utils import plot_label_insight
 from src.utils.SREA_utils import main_wrapper
+from src.utils.global_var import OUTPATH
+from src.utils.log_utils import StreamToLogger
+from src.utils.plotting_utils import plot_label_insight
+from src.utils.saver import Saver
+from src.utils.ucr_datasets import load_data
 
 warnings.filterwarnings("ignore")
 torch.backends.cudnn.benchmark = True
@@ -77,13 +76,16 @@ def parse_args():
     parser.add_argument('--padding', type=int, default=2)
 
     # Suppress terminal out
-    parser.add_argument('--disable_print', action='store_true', default=False, help='Suppress screen print, keep log.txt')
+    parser.add_argument('--disable_print', action='store_true', default=False,
+                        help='Suppress screen print, keep log.txt')
     parser.add_argument('--plt_loss', action='store_true', default=True, help='plot loss function each epoch')
     parser.add_argument('--plt_embedding', action='store_true', default=True, help='plot embedding representation')
-    parser.add_argument('--plt_loss_hist', action='store_true', default=True, help='plot loss history for clean and mislabled samples')
+    parser.add_argument('--plt_loss_hist', action='store_true', default=True,
+                        help='plot loss history for clean and mislabled samples')
     parser.add_argument('--plt_cm', action='store_true', default=True, help='plot confusion matrix')
     parser.add_argument('--plt_recons', action='store_true', default=True, help='plot AE reconstructions')
-    parser.add_argument('--headless', action='store_true', default=False, help='Matplotlib backend. Set true if no display connected.')
+    parser.add_argument('--headless', action='store_true', default=False,
+                        help='Matplotlib backend. Set true if no display connected.')
 
     # Add parameters for each particular network
     args = parser.parse_args()

@@ -1,9 +1,11 @@
 import numpy as np
+from sklearn.preprocessing import LabelEncoder
 from tslearn.datasets import UCR_UEA_datasets
 from tslearn.preprocessing import TimeSeriesScalerMeanVariance
-from sklearn.preprocessing import LabelEncoder
 
 ucr = UCR_UEA_datasets()
+
+
 # UCR/UEA univariate and multivariate datasets.
 
 

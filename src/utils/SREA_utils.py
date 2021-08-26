@@ -1,36 +1,29 @@
 import collections
-import itertools
 import logging
-import sys
 import os
 import shutil
+import sys
 from time import time
 
-from collections import deque
-
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn import cluster
+from sklearn.model_selection import train_test_split
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset
 
-from sklearn import cluster
-from sklearn.model_selection import train_test_split
-
+from src.models.MultiTaskClassification import AEandClass, NonLinClassifier
 from src.models.model import CNNAE
-from src.models.MultiTaskClassification import AEandClass, LinClassifier, NonLinClassifier
-from src.utils.saver import Saver
-from src.utils.utils import readable
 from src.utils.log_utils import StreamToLogger
+from src.utils.plotting_utils import plot_loss, plot_embedding, visualize_training_loss, plot_results
 from src.utils.ucr_datasets import load_data as load_ucr
 from src.utils.utils import cluster_accuracy, evaluate_class_recons, reset_seed_, reset_model, SaverSlave, flip_label, \
     append_results_dict, map_losstype, map_abg, remove_empty_dirs
-from src.utils.plotting_utils import plot_loss, plot_embedding, visualize_training_loss, plot_results
+from src.utils.utils import readable
 
 columns = shutil.get_terminal_size().columns
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -411,7 +404,6 @@ def main_wrapper(args, x_train, x_valid, x_test, Y_train_clean, Y_valid_clean, Y
     print('Validation:', x_valid.shape, Y_valid_clean.shape,
           [(Y_valid_clean == i).sum() for i in np.unique(Y_valid_clean)])
     print('Test:', x_test.shape, Y_test_clean.shape, [(Y_test_clean == i).sum() for i in np.unique(Y_test_clean)])
-
 
     ######################################################################################################
     # Main loop

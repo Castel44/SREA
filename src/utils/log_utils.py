@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 
+
 def get_logger(logger_name, level=logging.INFO, create_file=True, filepath=None):
     # create logger
     log = logging.getLogger(logger_name)
@@ -33,6 +34,7 @@ class StreamToLogger(object):
     """
     Fake file-like stream object that redirects writes to a logger instance.
     """
+
     def __init__(self, logger, log_level=logging.INFO):
         self.terminal = sys.stdout
         self.logger = logger
@@ -42,7 +44,7 @@ class StreamToLogger(object):
     def write(self, buf):
         # keep the console
         if self.log_level != logging.INFO:
-            self.terminal.write('\033[31m'+buf+'\033[0m')
+            self.terminal.write('\033[31m' + buf + '\033[0m')
         else:
             self.terminal.write(buf)
 

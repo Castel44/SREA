@@ -1,26 +1,13 @@
-import collections
-import itertools
-import logging
-import sys
-import os
-import shutil
-from time import time
-
-from collections import deque
-
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import seaborn as sns
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from matplotlib import cm
 from matplotlib.lines import Line2D
 
 import src.utils.utils as utils
 from src.utils.decorators import repeat, reset_rng
+
 
 ######################################################################################################
 class MplColorHelper:
@@ -269,27 +256,6 @@ def plot_cm(cm, T=None, network='Net', title_str='', saver=None):
     if saver:
         saver.save_fig(fig, f'CM_{title_str}')
 
-    ## Paper plot
-    # sns.set_context("paper")
-    # sns.set(style="whitegrid", font_scale=1, font='serif', rc={'mathtext.fontset': 'stix',
-    #                                                           "font.serif": ["stix"],
-    #                                                           })
-    # folder = '/home/castel/PycharmProjects/torchembedding/results/Load_CHP_noisy/paper_plot/'
-    # os.makedirs(folder, exist_ok=True)
-    # fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(5,5))
-    # sns.heatmap(cm_norm, annot=None, cmap=plt.cm.YlGnBu, cbar=False, ax=ax, linecolor='black', linewidths=0)
-    # ax.set(title='',
-    #       ylabel='True class',
-    #       xlabel='Predicted class')
-    # thresh = cm_norm.max() / 2.
-    # for i in range(cm.shape[0]):
-    #    for j in range(cm.shape[1]):
-    #        ax.text(j + 0.5, i + 0.5, '%d (%.2f)' % (cm[i, j], cm_norm[i, j]),
-    #                ha="center", va="center",
-    #                color="white" if cm_norm[i, j] > thresh else "black")
-    # fig.tight_layout()
-    # fig.savefig(os.path.join(folder, 'cm_asymm.pdf'), bbox_inches='tight')
-
 
 def plot_embedding(model, train_loader, valid_loader, cluster_centers, Y_train_clean, Y_valid_clean, Y_train, Y_valid,
                    saver, network='Model', correct=False):
@@ -337,41 +303,6 @@ def plot_embedding(model, train_loader, valid_loader, cluster_centers, Y_train_c
     ax.set_title(ttl)
     plt.tight_layout()
     saver.save_fig(plt.gcf(), name=f'{network}_latent_{str(correct)}')
-
-    # Paper plot
-    # folder ='/home/castel/PycharmProjects/torchembedding/results/Load_CHP_noisy/paper_plot/'
-    # os.makedirs(folder, exist_ok=True)
-    # sns.set_context("paper")
-    # sns.set(style="whitegrid", font_scale=1, font='serif', rc={'mathtext.fontset': 'stix',
-    #                                                           "font.serif": ["stix"],
-    #                                                           })
-    # cmap = mpl.colors.ListedColormap(['green', 'royalblue', 'cyan',
-    #                              'yellow', 'orange'])
-    # COL = MplColorHelper(cmap, 0, classes)
-    # mask = Y_valid==Y_valid_clean
-    # plt.figure(figsize=(4, 4))
-    # if train_embedding2d.shape[1] == 3:
-    #    ax = plt.axes(projection='3d')
-    # else:
-    #    ax = plt.axes()
-    # l0 = ax.scatter(*valid_embedding2d[mask].T, s=75, alpha=0.25, marker='o',
-    #                c=COL.get_rgb(Y_valid_clean[[mask]]))
-    # l1 = ax.scatter(*valid_embedding2d[~mask].T, s=40, alpha=0.35, marker='x', label='Noisy samples',
-    #                c='red')
-    # l2 = ax.scatter(*centroids.T, s=150, marker='P', label=r'Cluster Centers',
-    #                c='white', edgecolors='black')
-    # lines = [l0, l1, l2] #+ [Line2D([0], [0], marker='o', linestyle='', color=c, markersize=10) for c in [COL.get_rgb(i) for i in np.unique(Y_train_clean.astype(int))]]
-    # labels = [l0.get_label(), l1.get_label(), l2.get_label()] #+ [i for i in range(len(lines))]
-    # ax.legend(lines, labels, loc=1)
-    # ax.grid(True, which='major')
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(folder, 'embedding_asymm.pdf'), bbox_inches='tight')
-    # fig, ax = plt.subplots(figsize=(4, 1))
-    # col_map = plt.get_cmap(cmap)
-    # mpl.colorbar.ColorbarBase(ax, cmap=col_map, orientation='horizontal', values=[x for x in range(5)],
-    #                          ticks=[x for x in range(5)])
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(folder, 'colorbar.pdf'), bbox_inches='tight')
 
 
 def plot_hists_ephocs(loss, mask, auc=False, nrows=3, ncols=3, net='MLP', classes=5, saver=None, ni=None, pred_ni=None):
